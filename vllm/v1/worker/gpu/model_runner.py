@@ -1798,7 +1798,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # Models that declare `requires_raw_input_tokens` need the raw token
+            # ids on every layer, not just on the first PP stage (e.g. the
+            # DeepSeek-V4 vision MoE gate routes image sentinel tokens with
+            # `bias_vl`). `input_ids` is `input_batch.input_ids`, assigned
+            # unconditionally above, so it is valid on every rank.
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
