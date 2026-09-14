@@ -440,6 +440,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        # The bf16 kv-gather workspace reserved by the dummy run scales with
+        # PREFILL_CHUNK_SIZE * (max_model_len + window + batched) * head_dim *
+        # 2 bytes. At 1M context the default 4-way chunking costs 4 GiB, which
+        # no longer fits next to the resident weights (and the KV pool holds at
+        # most one such sequence anyway). Budget the workspace to ~1 GiB:
+        # short-context models keep the default concurrency, long-context ones
+        # fall back to fewer parallel prefill chunks.
+        gather_bytes_per_chunk = (
+            self.max_model_len + self.window_size + self.max_num_batched_tokens
+        ) * self.head_dim * 2
+        budget_chunks = max(1, int(1.0 * 1024**3 / gather_bytes_per_chunk))
+        self.PREFILL_CHUNK_SIZE = min(self.PREFILL_CHUNK_SIZE, budget_chunks)
+
         # Resolve the kv-cache dtype from this backend's block format. The same
         # resolution drives the SWA cache tensor dtype below.
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
