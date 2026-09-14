@@ -127,7 +127,7 @@ jobs:
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "$tags" | tr ',' '\n'
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         timeout-minutes: 2400
         with:
           context: .
