@@ -246,8 +246,29 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             mode="cpu",
         )
     elif backend == "uva":
+        max_bytes = int(uva.cpu_offload_gb * 1024**3)
+        # Per-PP-rank budget override (VLLM_CPU_OFFLOAD_GB_PER_RANK,
+        # comma-separated GiB indexed by PP rank). A uniform --cpu-offload-gb
+        # starves lightly loaded stages when one stage carries a disproportionate
+        # share of the weights (e.g. the 20-layer v4.1 kv-sharing group on the
+        # last rank); this lets each rank opt into its own budget.
+        per_rank = envs.VLLM_CPU_OFFLOAD_GB_PER_RANK
+        if per_rank:
+            try:
+                vals = [float(x) for x in per_rank.split(",") if x.strip()]
+            except ValueError:
+                logger.warning(
+                    "Ignoring malformed VLLM_CPU_OFFLOAD_GB_PER_RANK=%r", per_rank
+                )
+                vals = []
+            if vals:
+                from vllm.distributed.parallel_state import get_pp_group
+
+                rank = get_pp_group().rank_in_group
+                if rank < len(vals):
+                    max_bytes = int(vals[rank] * 1024**3)
         return UVAOffloader(
-            cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
+            cpu_offload_max_bytes=max_bytes,
             cpu_offload_params=uva.cpu_offload_params,
         )
     else:

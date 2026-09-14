@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -183,12 +184,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
+        shadow_feed_buffer: torch.Tensor | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        # When set, this layer is a cross-rank kv-source: its attention input
+        # is copied here every step and routed over the PP boundary to the
+        # shadow replicas on consumer ranks (see shadow_source.ShadowSource).
+        self.shadow_feed_buffer = shadow_feed_buffer
 
         self.engram: Engram | None = None
         if engram_layout is not None:
@@ -376,6 +382,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        if self.shadow_feed_buffer is not None:
+            # Tee the attention input to a persistent buffer for the PP send
+            # (same pattern as DeepseekV4Model._mtp_hidden_buffer): the graph
+            # replays this copy every step, and the runner sends the buffer
+            # after forward returns, when transient activations are gone.
+            self.shadow_feed_buffer[: x.shape[0]].copy_(x)
+
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
@@ -450,6 +463,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
+        # ---- cross-rank shadow kv-sources (PP splits inside a sharing group) --
+        # A kv-source layer's compressed-KV / indexer-K / candidate / topk
+        # outputs are consumed by every layer up to the next kv source; v4.1
+        # requires them to share a PP rank. When the partition lands inside a
+        # sharing group, consumer ranks host a ShadowSource that replays the
+        # source's attention from its (small, per-step) attention input,
+        # routed over the PP boundary as extra intermediate-tensor keys.
+        self._shadow_ids: list[int] = []
+        self._shadow_feeds_in: list[int] = []
+        self._shadow_feeds_out: list[int] = []
+        self._shadow_capture_buffers: dict[int, torch.Tensor] = {}
+        self.shadow_modules = nn.ModuleDict()
+        self._plan_shadow_sources(vllm_config, config, prefix, aux_stream_list)
+
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -471,6 +498,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
+                shadow_feed_buffer=self._shadow_capture_buffers.get(
+                    extract_layer_index(prefix)
+                ),
             ),
             prefix=f"{prefix}.layers",
         )
@@ -514,6 +544,75 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+    def _plan_shadow_sources(
+        self,
+        vllm_config: VllmConfig,
+        config,
+        prefix: str,
+        aux_stream_list: list[torch.cuda.Stream],
+    ) -> None:
+        """Plan (and build) cross-rank shadow replicas of kv-source layers.
+
+        A kv-source layer S's caches are consumed by layers (S, next_source];
+        v4.1 requires source and consumers to share a PP rank. This computes,
+        for every rank, the shadows it must host and the source-attention
+        inputs its boundary must carry, then instantiates this rank's shadows
+        BEFORE ``make_layers`` so consumer ``__init__`` lookups resolve.
+        """
+        from vllm.models.deepseek_v4_1.shadow_source import ShadowSource
+
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        sources = list(getattr(config, "kv_source_layer_ids", None) or ())
+        n_layers = config.num_hidden_layers
+        if pp_size <= 1 or not sources:
+            return
+
+        bounds = [get_pp_indices(n_layers, r, pp_size) for r in range(pp_size)]
+        my_rank = get_pp_group().rank_in_group
+        start, end = bounds[my_rank]
+
+        # Inclusive upper end of the consumer window of source S.
+        upper = {
+            S: (sources[i + 1] - 1) if i + 1 < len(sources) else n_layers - 1
+            for i, S in enumerate(sources)
+        }
+        shadows_by_rank = [
+            [S for S in sources if S < s and s <= upper[S]] for s, _ in bounds
+        ]
+
+        def feeds_into(r: int) -> list[int]:
+            """Sources whose attention input must cross the boundary into r."""
+            if r >= pp_size:
+                return []
+            return [
+                S
+                for S in sources
+                if S < bounds[r][0]
+                and any(S in shadows_by_rank[r2] for r2 in range(r, pp_size))
+            ]
+
+        self._shadow_ids = shadows_by_rank[my_rank]
+        self._shadow_feeds_in = feeds_into(my_rank)
+        self._shadow_feeds_out = feeds_into(my_rank + 1)
+
+        # Capture buffers for sources this rank owns and feeds downstream.
+        for S in self._shadow_feeds_out:
+            if start <= S < end:
+                self._shadow_capture_buffers[S] = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                )
+
+        for S in self._shadow_ids:
+            self.shadow_modules[f"shadow_{S}"] = ShadowSource(
+                vllm_config,
+                source_layer_prefix=f"{prefix}.layers.{S}",
+                topk_indices_buffer=self.topk_indices_buffer,
+                candidate_block_buffer=self.candidate_block_buffer,
+                aux_stream_list=aux_stream_list,
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -529,20 +628,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        # Attention inputs the previous boundary carries for this rank's
+        # shadow kv-sources ([num_tokens, hidden_size], source order).
+        for S in self._shadow_feeds_in:
+            tensors[f"shadow_x_{S}"] = torch.zeros(
+                (batch_size, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -631,6 +737,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+
+            # Replay shadow replicas of upstream kv-sources before the local
+            # layers run: their compressed-KV / indexer-K / candidate / topk
+            # outputs feed the consumers below, in source order.
+            for S in self._shadow_ids:
+                self.shadow_modules[f"shadow_{S}"](
+                    intermediate_tensors[f"shadow_x_{S}"], positions
+                )
+
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
@@ -668,9 +783,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            # Feed the downstream shadows: sources owned by this rank are
+            # tee'd from the capture buffers; upstream feeds already received
+            # are relayed unchanged.
+            for S in self._shadow_feeds_out:
+                buf = self._shadow_capture_buffers.get(S)
+                if buf is not None:
+                    tensors[f"shadow_x_{S}"] = buf[:full_num_tokens]
+                else:
+                    tensors[f"shadow_x_{S}"] = intermediate_tensors[
+                        f"shadow_x_{S}"
+                    ]
+            return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -726,11 +851,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and not self.use_sequence_parallel
         )
 
+        # Shadow replicas hold the source layer's attention subtree under a
+        # different module path; redirect those checkpoint keys so the normal
+        # loader (incl. the stacked wkv/wgate and attn_sink paths below) fills
+        # them. Other source-layer weights (ffn, norms, engram) stay unmapped
+        # and are skipped by the PP-missing check — the shadow doesn't own them.
+        shadow_attn_alias = {
+            f"layers.{S}.attn.": f"shadow_modules.shadow_{S}.attn."
+            for S in self._shadow_ids
+        }
+
         for name, loaded_weight in weights:
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
                 continue
+            for src, dst in shadow_attn_alias.items():
+                if name.startswith(src):
+                    name = dst + name[len(src) :]
+                    break
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight

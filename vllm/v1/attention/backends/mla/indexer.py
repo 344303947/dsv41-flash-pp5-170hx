@@ -833,7 +833,11 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    # At 1M context the 40x sizing costs 5.16 GiB at profile time, which no
+    # longer fits next to the resident weights. Cap the buffer at 128k tokens'
+    # worth (0.64 GiB): longer prefills are split into more gather chunks by
+    # _split_indexer_prefill_chunks (slower but correct).
+    return min(max_model_len, 131072) * 40
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:

@@ -718,20 +718,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
         # Convert weights to kernel format
-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
-            convert_weight_to_mxfp4_moe_kernel_format(
-                mxfp4_backend=self.mxfp4_backend,
-                layer=layer,
-                w13_weight=w13,
-                w2_weight=w2,
-                w13_weight_scale=w13_scale,
-                w2_weight_scale=w2_scale,
-                w13_bias=w13_bias,
-                w2_bias=w2_bias,
-                _cache_permute_indices=self._cache_permute_indices,
-                activation=self.moe.activation,
+        if self.mxfp4_backend in (
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ):
+            # Staged Marlin repack: the raw expert tensors are staged through
+            # host RAM inside the helper, so drop every local reference here
+            # first; any reference left alive would pin the raw weights on the
+            # GPU across the repack peak (raw + packed ~13 GiB per layer).
+            del w13, w2, w13_scale, w2_scale
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (  # noqa: E501
+                prepare_moe_mxfp4_layer_for_marlin_staged,
             )
-        )
+
+            prepare_moe_mxfp4_layer_for_marlin_staged(layer)
+            w13 = layer.w13_weight
+            w2 = layer.w2_weight
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            # The staged helper already permuted and installed the biases;
+            # refresh the locals so the replace below does not undo it.
+            w13_bias = getattr(layer, "w13_bias", None)
+            w2_bias = getattr(layer, "w2_bias", None)
+        else:
+            w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+                convert_weight_to_mxfp4_moe_kernel_format(
+                    mxfp4_backend=self.mxfp4_backend,
+                    layer=layer,
+                    w13_weight=w13,
+                    w2_weight=w2,
+                    w13_weight_scale=w13_scale,
+                    w2_weight_scale=w2_scale,
+                    w13_bias=w13_bias,
+                    w2_bias=w2_bias,
+                    _cache_permute_indices=self._cache_permute_indices,
+                    activation=self.moe.activation,
+                )
+            )
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
@@ -774,17 +797,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        # Pass the raw tensors without holding local references: the staged
+        # Marlin repack moves them to host RAM and drops the GPU copy, and a
+        # reference kept here would pin the raw weights through the repack.
+        self._setup_kernel(
+            layer,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
 
     def get_fused_moe_quant_config(
         self,

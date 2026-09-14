@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -903,6 +904,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+    # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+    # loaded pipeline stages can offload more than lighter ones.
+    "VLLM_CPU_OFFLOAD_GB_PER_RANK": lambda: os.getenv(
+        "VLLM_CPU_OFFLOAD_GB_PER_RANK", None
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

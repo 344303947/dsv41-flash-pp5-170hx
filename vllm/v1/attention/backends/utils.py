@@ -266,10 +266,39 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
-    )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    if all(names == supported_layouts[0] for names in supported_layouts[1:]):
+        candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    else:
+        # A worker whose stage holds no layers of a given backend class (e.g.
+        # the pure-dense first stage of the legacy 2,6,6,6,20 v4.1 split)
+        # legitimately reports a wider set than the others. Only the
+        # intersection is usable everywhere; order it by how many workers put
+        # each layout first so all ranks still converge on one name.
+        priorities: dict[str, int] = defaultdict(int)
+        for names in supported_layouts:
+            priorities[names[0]] += 1
+        common = set(supported_layouts[0])
+        for names in supported_layouts[1:]:
+            common &= set(names)
+        if not common:
+            raise ValueError(
+                "Workers disagree on supported KV cache layouts: "
+                f"{supported_layouts}."
+            )
+        ordered: list[str] = []
+        for names in supported_layouts:
+            for name in names:
+                if name in common and name not in ordered:
+                    ordered.append(name)
+        logger.warning(
+            "Workers reported different supported KV cache layouts %s; "
+            "using their intersection.",
+            supported_layouts,
+        )
+        candidates = [
+            _layout_from_name(name)
+            for name in sorted(ordered, key=lambda n: priorities[n], reverse=True)
+        ]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of

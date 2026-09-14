@@ -579,6 +579,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
+    @eager_break_during_capture
+    def produce_kv_side_effects(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        """Populate this layer's KV-producing side effects WITHOUT computing the
+        layer's attention output.
+
+        Runs the exact same input projections, compressor and indexer as the
+        normal forward (so the emitted compressed-KV / indexer-K rows and the
+        published candidates/topk are bit-identical to the real source layer),
+        but skips the sparse-attention read and the output projection.
+
+        Used by cross-rank shadow replicas (see ``shadow_source.ShadowSource``)
+        so a consumer rank can rebuild a kv-source layer's caches locally when a
+        PP split lands inside a v4.1 kv-sharing group. ``hidden_states`` must be
+        the source layer's *input* residual stream.
+
+        The eager break keeps the cache writes and the top-k selection outside
+        the captured graph, matching the source layer's own attention prep
+        (``_prepare_and_attn_eager``): capturing them would freeze the
+        ``is_current_stream_capturing`` / ``max_seq_len`` host branches and
+        leave ``topk_indices_buffer`` unwritten on replay.
+        """
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
+        )
+        qr, qr_scale, _kv = self._split_qkv_and_norm(qr_kv)
+        latent: torch.Tensor | None = None
+        if self.compressor is not None:
+            latent = self.compressor(kv_score, positions)
+            self.compressor.insert_cache(latent, positions, self.rotary_emb)
+        if self.indexer is not None:
+            index_q, index_q_scale, index_weights = self.indexer(
+                qr,
+                latent,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+                qr_scale,
+            )
+            if index_q is not None:
+                # Long context: the indexer returned prepared queries, so run
+                # the same top-k selection the consumers read. The
+                # short-context branch fills the buffer inside ``indexer``
+                # itself and returns None queries.
+                assert index_weights is not None
+                q_quant = (
+                    (index_q, index_q_scale) if index_q_scale is not None else index_q
+                )
+                self.indexer.indexer_op(hidden_states, q_quant, None, index_weights)
+
     @cached_property
     def _can_fuse_query_quant(self) -> bool:
         from vllm.models.deepseek_v4_1.common.ops.query_quant import (

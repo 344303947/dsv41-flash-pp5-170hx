@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import round_up
 
 FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16]
@@ -673,6 +674,127 @@ def prepare_moe_mxfp4_layer_for_marlin(
     w2_bias = permute_bias(w2_bias)
 
     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
+
+
+def _repack_marlin_experts_staged(
+    layer: torch.nn.Module,
+    name: str,
+    size_n: int,
+    size_k: int,
+    is_a_8bit: bool,
+) -> torch.Tensor:
+    """Repack one MoE expert weight through host RAM.
+
+    vLLM's plain repack keeps the raw [E, N, K/2] tensor on the GPU while the
+    packed copy is built, so every MoE layer costs ~6.7 GiB of transient HBM
+    at load. Here the raw tensor is moved to the host first and the packed
+    tensor is filled expert by expert, so the GPU peak is just the packed
+    weight.
+    """
+    raw = getattr(layer, name)
+    device = raw.device
+    e = raw.shape[0]
+    assert raw.shape == (e, size_n, size_k // 2), raw.shape
+    # Pageable on purpose: torch's pinned-host allocator caches freed blocks
+    # for the life of the process, which would keep the host RAM locked.
+    host = torch.empty(raw.shape, dtype=raw.dtype, device="cpu")
+    host.copy_(raw.data)
+    torch.cuda.synchronize(device)
+    # Drop the layer's GPU reference before allocating the packed output.
+    replace_parameter(layer, name, torch.empty(0, dtype=raw.dtype, device=device))
+    del raw
+    torch.cuda.empty_cache()
+    out: torch.Tensor | None = None
+    stage = torch.empty(host.shape[1:], dtype=host.dtype, device=device)
+    for i in range(e):
+        stage.copy_(host[i])
+        qweight = stage.view(torch.int32).T.contiguous()
+        packed = ops.gptq_marlin_repack(
+            b_q_weight=qweight,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+            is_a_8bit=is_a_8bit,
+        )
+        if out is None:
+            out = torch.empty((e, *packed.shape), dtype=packed.dtype, device=device)
+        out[i] = packed
+    del stage, host
+    assert out is not None
+    return out
+
+
+def prepare_moe_mxfp4_layer_for_marlin_staged(layer: torch.nn.Module) -> None:
+    """In-place staged equivalent of prepare_moe_mxfp4_layer_for_marlin.
+
+    Repacks the layer's MXFP4 expert weights in place, staging the raw tensors
+    through host RAM so the GPU load-time transient is the packed weight only.
+    Callers must not hold references to the raw parameters.
+    """
+    input_dtype = get_marlin_input_dtype()
+    if (
+        input_dtype is not None
+        and input_dtype.itemsize == 1
+        and input_dtype != torch.float8_e4m3fn
+    ):
+        raise RuntimeError("MXFP4 weight + INT8 activation is not supported.")
+
+    group_size = 32  # MXFP4 block size
+
+    w13 = layer.w13_weight
+    e, n2, khalf = w13.shape
+    n, k = n2 // 2, khalf * 2
+    device = w13.device
+    param_dtype = layer.params_dtype
+    is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
+    del w13
+    layer.workspace = marlin_make_workspace_new(
+        device, 4, existing=getattr(layer, "workspace", None)
+    )
+
+    for name, size_n, size_k in (("w13_weight", n * 2, k), ("w2_weight", k, n)):
+        packed = _repack_marlin_experts_staged(layer, name, size_n, size_k, is_a_8bit)
+        replace_parameter(layer, name, packed)
+        del packed
+        torch.cuda.empty_cache()
+
+    for name, size_n, size_k in (("w13", n * 2, k), ("w2", k, n)):
+        scales = (
+            getattr(layer, name + "_weight_scale")
+            .view(torch.float8_e8m0fnu)
+            .to(param_dtype)
+        )
+        tensor_list = []
+        for i in range(e):
+            marlin_scales = marlin_permute_scales(
+                s=scales[i].T,
+                size_k=size_k,
+                size_n=size_n,
+                group_size=group_size,
+                is_a_8bit=is_a_8bit,
+            )
+            tensor_list.append(
+                mxfp4_marlin_process_scales(marlin_scales, input_dtype=input_dtype)
+            )
+        replace_parameter(
+            layer,
+            name + "_weight_scale",
+            torch.cat([x.unsqueeze(0) for x in tensor_list], 0),
+        )
+        del scales, tensor_list
+
+    for name in ("w13_bias", "w2_bias"):
+        bias = getattr(layer, name, None)
+        if bias is None:
+            continue
+        bias = bias.to(param_dtype)
+        replace_parameter(
+            layer,
+            name,
+            torch.cat(
+                [marlin_permute_bias(bias[i]).unsqueeze(0) for i in range(e)], 0
+            ),
+        )
 
 
 def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):

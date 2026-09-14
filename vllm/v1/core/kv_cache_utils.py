@@ -1728,8 +1728,15 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            # Iterate the group's own layers, not the spec dict: after PP
+            # projection an empty group keeps the global spec (so the
+            # scheduler can still read its block sizes), and emitting tensors
+            # for the global layers would allocate caches for layers this
+            # worker does not own.
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(
+                    layer_name
+                )
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
@@ -2508,6 +2515,12 @@ def _project_kv_cache_groups_to_worker(
         worker_layer_names = [
             layer_name for layer_name in group.layer_names if layer_name in worker_spec
         ]
+        # A group with no local layers is kept with its global spec so every
+        # worker reports the same group list (the scheduler and the workers
+        # index block tables by group position, so dropping one would shift
+        # the mapping) and the scheduler can still read its block sizes.
+        # Tensor generation filters by layer_names, so an empty group emits
+        # no tensors (see get_kv_cache_config_from_groups).
         group_spec = group.kv_cache_spec
         if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
