@@ -1,0 +1,711 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1718bfe62a..c5c529da0c 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -48,6 +48,7 @@ if TYPE_CHECKING:
+     VLLM_TRACE_FUNCTION: int = 0
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
++    VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
+     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
+@@ -903,6 +904,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     # Pipeline stage partition strategy
+     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
++    # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
++    # rank). Overrides --cpu-offload-gb for the matching rank so heavily
++    # loaded pipeline stages can offload more than lighter ones.
++    "VLLM_CPU_OFFLOAD_GB_PER_RANK": lambda: os.getenv(
++        "VLLM_CPU_OFFLOAD_GB_PER_RANK", None
++    ),
+     # (CPU backend only) CPU key-value cache space.
+     # default is None and will be set as 4 GB
+     "VLLM_CPU_KVCACHE_SPACE": lambda: (
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index 1f994ab56c..f0cb002d5a 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -718,20 +718,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                 )
+ 
+         # Convert weights to kernel format
+-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+-            convert_weight_to_mxfp4_moe_kernel_format(
+-                mxfp4_backend=self.mxfp4_backend,
+-                layer=layer,
+-                w13_weight=w13,
+-                w2_weight=w2,
+-                w13_weight_scale=w13_scale,
+-                w2_weight_scale=w2_scale,
+-                w13_bias=w13_bias,
+-                w2_bias=w2_bias,
+-                _cache_permute_indices=self._cache_permute_indices,
+-                activation=self.moe.activation,
++        if self.mxfp4_backend in (
++            Mxfp4MoeBackend.MARLIN,
++            Mxfp4MoeBackend.BATCHED_MARLIN,
++        ):
++            # Staged Marlin repack: the raw expert tensors are staged through
++            # host RAM inside the helper, so drop every local reference here
++            # first; any reference left alive would pin the raw weights on the
++            # GPU across the repack peak (raw + packed ~13 GiB per layer).
++            del w13, w2, w13_scale, w2_scale
++            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (  # noqa: E501
++                prepare_moe_mxfp4_layer_for_marlin_staged,
++            )
++
++            prepare_moe_mxfp4_layer_for_marlin_staged(layer)
++            w13 = layer.w13_weight
++            w2 = layer.w2_weight
++            w13_scale = layer.w13_weight_scale
++            w2_scale = layer.w2_weight_scale
++            # The staged helper already permuted and installed the biases;
++            # refresh the locals so the replace below does not undo it.
++            w13_bias = getattr(layer, "w13_bias", None)
++            w2_bias = getattr(layer, "w2_bias", None)
++        else:
++            w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
++                convert_weight_to_mxfp4_moe_kernel_format(
++                    mxfp4_backend=self.mxfp4_backend,
++                    layer=layer,
++                    w13_weight=w13,
++                    w2_weight=w2,
++                    w13_weight_scale=w13_scale,
++                    w2_weight_scale=w2_scale,
++                    w13_bias=w13_bias,
++                    w2_bias=w2_bias,
++                    _cache_permute_indices=self._cache_permute_indices,
++                    activation=self.moe.activation,
++                )
+             )
+-        )
+ 
+         # For TRITON backends, weights are wrapped tensors from triton_kernels
+         # that don't support .detach(). Manually assign parameters.
+@@ -774,17 +797,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+ 
+     def process_weights_after_loading(self, layer):
+-        w13 = layer.w13_weight
+-        w2 = layer.w2_weight
+-        w13_scale = layer.w13_weight_scale
+-        w2_scale = layer.w2_weight_scale
+         w13_bias = getattr(layer, "w13_bias", None)
+         w2_bias = getattr(layer, "w2_bias", None)
+ 
+         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+             return
+ 
+-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
++        # Pass the raw tensors without holding local references: the staged
++        # Marlin repack moves them to host RAM and drops the GPU copy, and a
++        # reference kept here would pin the raw weights through the repack.
++        self._setup_kernel(
++            layer,
++            layer.w13_weight,
++            layer.w2_weight,
++            layer.w13_weight_scale,
++            layer.w2_weight_scale,
++            w13_bias,
++            w2_bias,
++        )
+ 
+     def get_fused_moe_quant_config(
+         self,
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+index 3b6990101e..ef7e61e52c 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import scalar_types
++from vllm.model_executor.utils import replace_parameter
+ from vllm.utils.math_utils import round_up
+ 
+ FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16]
+@@ -675,6 +676,127 @@ def prepare_moe_mxfp4_layer_for_marlin(
+     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
+ 
+ 
++def _repack_marlin_experts_staged(
++    layer: torch.nn.Module,
++    name: str,
++    size_n: int,
++    size_k: int,
++    is_a_8bit: bool,
++) -> torch.Tensor:
++    """Repack one MoE expert weight through host RAM.
++
++    vLLM's plain repack keeps the raw [E, N, K/2] tensor on the GPU while the
++    packed copy is built, so every MoE layer costs ~6.7 GiB of transient HBM
++    at load. Here the raw tensor is moved to the host first and the packed
++    tensor is filled expert by expert, so the GPU peak is just the packed
++    weight.
++    """
++    raw = getattr(layer, name)
++    device = raw.device
++    e = raw.shape[0]
++    assert raw.shape == (e, size_n, size_k // 2), raw.shape
++    # Pageable on purpose: torch's pinned-host allocator caches freed blocks
++    # for the life of the process, which would keep the host RAM locked.
++    host = torch.empty(raw.shape, dtype=raw.dtype, device="cpu")
++    host.copy_(raw.data)
++    torch.cuda.synchronize(device)
++    # Drop the layer's GPU reference before allocating the packed output.
++    replace_parameter(layer, name, torch.empty(0, dtype=raw.dtype, device=device))
++    del raw
++    torch.cuda.empty_cache()
++    out: torch.Tensor | None = None
++    stage = torch.empty(host.shape[1:], dtype=host.dtype, device=device)
++    for i in range(e):
++        stage.copy_(host[i])
++        qweight = stage.view(torch.int32).T.contiguous()
++        packed = ops.gptq_marlin_repack(
++            b_q_weight=qweight,
++            size_k=size_k,
++            size_n=size_n,
++            num_bits=4,
++            is_a_8bit=is_a_8bit,
++        )
++        if out is None:
++            out = torch.empty((e, *packed.shape), dtype=packed.dtype, device=device)
++        out[i] = packed
++    del stage, host
++    assert out is not None
++    return out
++
++
++def prepare_moe_mxfp4_layer_for_marlin_staged(layer: torch.nn.Module) -> None:
++    """In-place staged equivalent of prepare_moe_mxfp4_layer_for_marlin.
++
++    Repacks the layer's MXFP4 expert weights in place, staging the raw tensors
++    through host RAM so the GPU load-time transient is the packed weight only.
++    Callers must not hold references to the raw parameters.
++    """
++    input_dtype = get_marlin_input_dtype()
++    if (
++        input_dtype is not None
++        and input_dtype.itemsize == 1
++        and input_dtype != torch.float8_e4m3fn
++    ):
++        raise RuntimeError("MXFP4 weight + INT8 activation is not supported.")
++
++    group_size = 32  # MXFP4 block size
++
++    w13 = layer.w13_weight
++    e, n2, khalf = w13.shape
++    n, k = n2 // 2, khalf * 2
++    device = w13.device
++    param_dtype = layer.params_dtype
++    is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
++    del w13
++    layer.workspace = marlin_make_workspace_new(
++        device, 4, existing=getattr(layer, "workspace", None)
++    )
++
++    for name, size_n, size_k in (("w13_weight", n * 2, k), ("w2_weight", k, n)):
++        packed = _repack_marlin_experts_staged(layer, name, size_n, size_k, is_a_8bit)
++        replace_parameter(layer, name, packed)
++        del packed
++        torch.cuda.empty_cache()
++
++    for name, size_n, size_k in (("w13", n * 2, k), ("w2", k, n)):
++        scales = (
++            getattr(layer, name + "_weight_scale")
++            .view(torch.float8_e8m0fnu)
++            .to(param_dtype)
++        )
++        tensor_list = []
++        for i in range(e):
++            marlin_scales = marlin_permute_scales(
++                s=scales[i].T,
++                size_k=size_k,
++                size_n=size_n,
++                group_size=group_size,
++                is_a_8bit=is_a_8bit,
++            )
++            tensor_list.append(
++                mxfp4_marlin_process_scales(marlin_scales, input_dtype=input_dtype)
++            )
++        replace_parameter(
++            layer,
++            name + "_weight_scale",
++            torch.cat([x.unsqueeze(0) for x in tensor_list], 0),
++        )
++        del scales, tensor_list
++
++    for name in ("w13_bias", "w2_bias"):
++        bias = getattr(layer, name, None)
++        if bias is None:
++            continue
++        bias = bias.to(param_dtype)
++        replace_parameter(
++            layer,
++            name,
++            torch.cat(
++                [marlin_permute_bias(bias[i]).unsqueeze(0) for i in range(e)], 0
++            ),
++        )
++
++
+ def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
+     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
+ 
+diff --git a/vllm/model_executor/offloader/base.py b/vllm/model_executor/offloader/base.py
+index 5e381e9194..7b284d2cf6 100644
+--- a/vllm/model_executor/offloader/base.py
++++ b/vllm/model_executor/offloader/base.py
+@@ -246,8 +246,29 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
+             mode="cpu",
+         )
+     elif backend == "uva":
++        max_bytes = int(uva.cpu_offload_gb * 1024**3)
++        # Per-PP-rank budget override (VLLM_CPU_OFFLOAD_GB_PER_RANK,
++        # comma-separated GiB indexed by PP rank). A uniform --cpu-offload-gb
++        # starves lightly loaded stages when one stage carries a disproportionate
++        # share of the weights (e.g. the 20-layer v4.1 kv-sharing group on the
++        # last rank); this lets each rank opt into its own budget.
++        per_rank = envs.VLLM_CPU_OFFLOAD_GB_PER_RANK
++        if per_rank:
++            try:
++                vals = [float(x) for x in per_rank.split(",") if x.strip()]
++            except ValueError:
++                logger.warning(
++                    "Ignoring malformed VLLM_CPU_OFFLOAD_GB_PER_RANK=%r", per_rank
++                )
++                vals = []
++            if vals:
++                from vllm.distributed.parallel_state import get_pp_group
++
++                rank = get_pp_group().rank_in_group
++                if rank < len(vals):
++                    max_bytes = int(vals[rank] * 1024**3)
+         return UVAOffloader(
+-            cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
++            cpu_offload_max_bytes=max_bytes,
+             cpu_offload_params=uva.cpu_offload_params,
+         )
+     else:
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index d4eb918c5e..93e2e9722f 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -579,6 +579,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
+         return self._o_proj(o, positions)
+ 
++    @eager_break_during_capture
++    def produce_kv_side_effects(
++        self, hidden_states: torch.Tensor, positions: torch.Tensor
++    ) -> None:
++        """Populate this layer's KV-producing side effects WITHOUT computing the
++        layer's attention output.
++
++        Runs the exact same input projections, compressor and indexer as the
++        normal forward (so the emitted compressed-KV / indexer-K rows and the
++        published candidates/topk are bit-identical to the real source layer),
++        but skips the sparse-attention read and the output projection.
++
++        Used by cross-rank shadow replicas (see ``shadow_source.ShadowSource``)
++        so a consumer rank can rebuild a kv-source layer's caches locally when a
++        PP split lands inside a v4.1 kv-sharing group. ``hidden_states`` must be
++        the source layer's *input* residual stream.
++
++        The eager break keeps the cache writes and the top-k selection outside
++        the captured graph, matching the source layer's own attention prep
++        (``_prepare_and_attn_eager``): capturing them would freeze the
++        ``is_current_stream_capturing`` / ``max_seq_len`` host branches and
++        leave ``topk_indices_buffer`` unwritten on replay.
++        """
++        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
++            hidden_states
++        )
++        qr, qr_scale, _kv = self._split_qkv_and_norm(qr_kv)
++        latent: torch.Tensor | None = None
++        if self.compressor is not None:
++            latent = self.compressor(kv_score, positions)
++            self.compressor.insert_cache(latent, positions, self.rotary_emb)
++        if self.indexer is not None:
++            index_q, index_q_scale, index_weights = self.indexer(
++                qr,
++                latent,
++                indexer_weights,
++                positions,
++                self.indexer_rotary_emb,
++                qr_scale,
++            )
++            if index_q is not None:
++                # Long context: the indexer returned prepared queries, so run
++                # the same top-k selection the consumers read. The
++                # short-context branch fills the buffer inside ``indexer``
++                # itself and returns None queries.
++                assert index_weights is not None
++                q_quant = (
++                    (index_q, index_q_scale) if index_q_scale is not None else index_q
++                )
++                self.indexer.indexer_op(hidden_states, q_quant, None, index_weights)
++
+     @cached_property
+     def _can_fuse_query_quant(self) -> bool:
+         from vllm.models.deepseek_v4_1.common.ops.query_quant import (
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 0eb3451989..085bedb5bf 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -16,6 +16,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+ )
++from vllm.distributed.utils import get_pp_indices
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+@@ -183,12 +184,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+         aux_stream_list: list[torch.cuda.Stream] | None = None,
+         candidate_block_buffer: torch.Tensor | None = None,
+         engram_layout: EngramLayout | None = None,
++        shadow_feed_buffer: torch.Tensor | None = None,
+     ):
+         super().__init__()
+ 
+         config = vllm_config.model_config.hf_config
+         self.hidden_size = config.hidden_size
+         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
++        # When set, this layer is a cross-rank kv-source: its attention input
++        # is copied here every step and routed over the PP boundary to the
++        # shadow replicas on consumer ranks (see shadow_source.ShadowSource).
++        self.shadow_feed_buffer = shadow_feed_buffer
+ 
+         self.engram: Engram | None = None
+         if engram_layout is not None:
+@@ -376,6 +382,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+         if self.use_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
++        if self.shadow_feed_buffer is not None:
++            # Tee the attention input to a persistent buffer for the PP send
++            # (same pattern as DeepseekV4Model._mtp_hidden_buffer): the graph
++            # replays this copy every step, and the runner sends the buffer
++            # after forward returns, when transient activations are gone.
++            self.shadow_feed_buffer[: x.shape[0]].copy_(x)
++
+         x = self.attn(positions, x, None)
+         if self.use_sequence_parallel:
+             x = sp_reduce_scatter(x)
+@@ -450,6 +463,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         else:
+             self.candidate_block_buffer = None
+ 
++        # ---- cross-rank shadow kv-sources (PP splits inside a sharing group) --
++        # A kv-source layer's compressed-KV / indexer-K / candidate / topk
++        # outputs are consumed by every layer up to the next kv source; v4.1
++        # requires them to share a PP rank. When the partition lands inside a
++        # sharing group, consumer ranks host a ShadowSource that replays the
++        # source's attention from its (small, per-step) attention input,
++        # routed over the PP boundary as extra intermediate-tensor keys.
++        self._shadow_ids: list[int] = []
++        self._shadow_feeds_in: list[int] = []
++        self._shadow_feeds_out: list[int] = []
++        self._shadow_capture_buffers: dict[int, torch.Tensor] = {}
++        self.shadow_modules = nn.ModuleDict()
++        self._plan_shadow_sources(vllm_config, config, prefix, aux_stream_list)
++
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+@@ -471,6 +498,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 aux_stream_list=aux_stream_list,
+                 candidate_block_buffer=self.candidate_block_buffer,
+                 engram_layout=self.engram_layout,
++                shadow_feed_buffer=self._shadow_capture_buffers.get(
++                    extract_layer_index(prefix)
++                ),
+             ),
+             prefix=f"{prefix}.layers",
+         )
+@@ -514,6 +544,75 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         else:
+             self._mtp_hidden_buffer = None
+ 
++    def _plan_shadow_sources(
++        self,
++        vllm_config: VllmConfig,
++        config,
++        prefix: str,
++        aux_stream_list: list[torch.cuda.Stream],
++    ) -> None:
++        """Plan (and build) cross-rank shadow replicas of kv-source layers.
++
++        A kv-source layer S's caches are consumed by layers (S, next_source];
++        v4.1 requires source and consumers to share a PP rank. This computes,
++        for every rank, the shadows it must host and the source-attention
++        inputs its boundary must carry, then instantiates this rank's shadows
++        BEFORE ``make_layers`` so consumer ``__init__`` lookups resolve.
++        """
++        from vllm.models.deepseek_v4_1.shadow_source import ShadowSource
++
++        pp_size = vllm_config.parallel_config.pipeline_parallel_size
++        sources = list(getattr(config, "kv_source_layer_ids", None) or ())
++        n_layers = config.num_hidden_layers
++        if pp_size <= 1 or not sources:
++            return
++
++        bounds = [get_pp_indices(n_layers, r, pp_size) for r in range(pp_size)]
++        my_rank = get_pp_group().rank_in_group
++        start, end = bounds[my_rank]
++
++        # Inclusive upper end of the consumer window of source S.
++        upper = {
++            S: (sources[i + 1] - 1) if i + 1 < len(sources) else n_layers - 1
++            for i, S in enumerate(sources)
++        }
++        shadows_by_rank = [
++            [S for S in sources if S < s and s <= upper[S]] for s, _ in bounds
++        ]
++
++        def feeds_into(r: int) -> list[int]:
++            """Sources whose attention input must cross the boundary into r."""
++            if r >= pp_size:
++                return []
++            return [
++                S
++                for S in sources
++                if S < bounds[r][0]
++                and any(S in shadows_by_rank[r2] for r2 in range(r, pp_size))
++            ]
++
++        self._shadow_ids = shadows_by_rank[my_rank]
++        self._shadow_feeds_in = feeds_into(my_rank)
++        self._shadow_feeds_out = feeds_into(my_rank + 1)
++
++        # Capture buffers for sources this rank owns and feeds downstream.
++        for S in self._shadow_feeds_out:
++            if start <= S < end:
++                self._shadow_capture_buffers[S] = torch.empty(
++                    vllm_config.scheduler_config.max_num_batched_tokens,
++                    config.hidden_size,
++                    dtype=vllm_config.model_config.dtype,
++                )
++
++        for S in self._shadow_ids:
++            self.shadow_modules[f"shadow_{S}"] = ShadowSource(
++                vllm_config,
++                source_layer_prefix=f"{prefix}.layers.{S}",
++                topk_indices_buffer=self.topk_indices_buffer,
++                candidate_block_buffer=self.candidate_block_buffer,
++                aux_stream_list=aux_stream_list,
++            )
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
+@@ -529,20 +628,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # layer and keeps that shape until the final hc collapse — plus the
+         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
+         # for its attention collapse.
+-        return IntermediateTensors(
+-            {
+-                "hidden_states": torch.zeros(
+-                    (batch_size, self.hc_mult, self.config.hidden_size),
+-                    dtype=dtype,
+-                    device=device,
+-                ),
+-                "pre_mix": torch.zeros(
+-                    (batch_size, self.hc_mult),
+-                    dtype=torch.float32,
+-                    device=device,
+-                ),
+-            }
+-        )
++        tensors = {
++            "hidden_states": torch.zeros(
++                (batch_size, self.hc_mult, self.config.hidden_size),
++                dtype=dtype,
++                device=device,
++            ),
++            "pre_mix": torch.zeros(
++                (batch_size, self.hc_mult),
++                dtype=torch.float32,
++                device=device,
++            ),
++        }
++        # Attention inputs the previous boundary carries for this rank's
++        # shadow kv-sources ([num_tokens, hidden_size], source order).
++        for S in self._shadow_feeds_in:
++            tensors[f"shadow_x_{S}"] = torch.zeros(
++                (batch_size, self.config.hidden_size),
++                dtype=dtype,
++                device=device,
++            )
++        return IntermediateTensors(tensors)
+ 
+     def forward(
+         self,
+@@ -631,6 +737,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         if not get_pp_group().is_first_rank:
+             assert intermediate_tensors is not None
+             pre_mix = intermediate_tensors["pre_mix"]
++
++            # Replay shadow replicas of upstream kv-sources before the local
++            # layers run: their compressed-KV / indexer-K / candidate / topk
++            # outputs feed the consumers below, in source order.
++            for S in self._shadow_ids:
++                self.shadow_modules[f"shadow_{S}"](
++                    intermediate_tensors[f"shadow_x_{S}"], positions
++                )
++
+         aux_hidden_states: list[torch.Tensor] = []
+         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+         for idx, layer in enumerate(
+@@ -668,9 +783,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+-            )
++            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
++            # Feed the downstream shadows: sources owned by this rank are
++            # tee'd from the capture buffers; upstream feeds already received
++            # are relayed unchanged.
++            for S in self._shadow_feeds_out:
++                buf = self._shadow_capture_buffers.get(S)
++                if buf is not None:
++                    tensors[f"shadow_x_{S}"] = buf[:full_num_tokens]
++                else:
++                    tensors[f"shadow_x_{S}"] = intermediate_tensors[
++                        f"shadow_x_{S}"
++                    ]
++            return IntermediateTensors(tensors)
+ 
+         # MTP needs full HC states; otherwise collapse and normalize locally
+         # before gathering to reduce communication.
+@@ -726,11 +851,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             and not self.use_sequence_parallel
+         )
+ 
++        # Shadow replicas hold the source layer's attention subtree under a
++        # different module path; redirect those checkpoint keys so the normal
++        # loader (incl. the stacked wkv/wgate and attn_sink paths below) fills
++        # them. Other source-layer weights (ffn, norms, engram) stay unmapped
++        # and are skipped by the PP-missing check — the shadow doesn't own them.
++        shadow_attn_alias = {
++            f"layers.{S}.attn.": f"shadow_modules.shadow_{S}.attn."
++            for S in self._shadow_ids
++        }
++
+         for name, loaded_weight in weights:
+             if name.startswith(("vision.", "aligner.", "image_")):
+                 # Vision weights are loaded by the outer multimodal wrapper.
+                 logger.warning_once("Skipping non-text weight: %s", name)
+                 continue
++            for src, dst in shadow_attn_alias.items():
++                if name.startswith(src):
++                    name = dst + name[len(src) :]
++                    break
+             if pad_shared_expert and ".shared_experts." in name:
+                 loaded_weight = self._pad_shared_expert_weight(
+                     self.quant_config, name, loaded_weight
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 735f8f4293..e9fce5e0a6 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -833,7 +833,11 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    # At 1M context the 40x sizing costs 5.16 GiB at profile time, which no
++    # longer fits next to the resident weights. Cap the buffer at 128k tokens'
++    # worth (0.64 GiB): longer prefills are split into more gather chunks by
++    # _split_indexer_prefill_chunks (slower but correct).
++    return min(max_model_len, 131072) * 40
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:
+diff --git a/vllm/v1/attention/backends/utils.py b/vllm/v1/attention/backends/utils.py
+index f7dd94e2ac..677b389be7 100644
+--- a/vllm/v1/attention/backends/utils.py
++++ b/vllm/v1/attention/backends/utils.py
+@@ -266,10 +266,39 @@ def resolve_kv_cache_layout(
+     assert supported_layouts and all(supported_layouts), (
+         "No worker reported supported KV cache layouts."
+     )
+-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
+-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+-    )
+-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
++    if all(names == supported_layouts[0] for names in supported_layouts[1:]):
++        candidates = [_layout_from_name(name) for name in supported_layouts[0]]
++    else:
++        # A worker whose stage holds no layers of a given backend class (e.g.
++        # the pure-dense first stage of the legacy 2,6,6,6,20 v4.1 split)
++        # legitimately reports a wider set than the others. Only the
++        # intersection is usable everywhere; order it by how many workers put
++        # each layout first so all ranks still converge on one name.
++        priorities: dict[str, int] = defaultdict(int)
++        for names in supported_layouts:
++            priorities[names[0]] += 1
++        common = set(supported_layouts[0])
++        for names in supported_layouts[1:]:
++            common &= set(names)
++        if not common:
++            raise ValueError(
++                "Workers disagree on supported KV cache layouts: "
++                f"{supported_layouts}."
++            )
++        ordered: list[str] = []
++        for names in supported_layouts:
++            for name in names:
++                if name in common and name not in ordered:
++                    ordered.append(name)
++        logger.warning(
++            "Workers reported different supported KV cache layouts %s; "
++            "using their intersection.",
++            supported_layouts,
++        )
++        candidates = [
++            _layout_from_name(name)
++            for name in sorted(ordered, key=lambda n: priorities[n], reverse=True)
++        ]
+ 
+     # A block-compact layout means the block is densely packed in memory, so any mix of
+     # specs can re-interpret HNC with different sizes as long as the total number of
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index e2e38ec5d5..7ee001dc29 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1728,8 +1728,15 @@ def get_kv_cache_config_from_groups(
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+-            for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++            # Iterate the group's own layers, not the spec dict: after PP
++            # projection an empty group keeps the global spec (so the
++            # scheduler can still read its block sizes), and emitting tensors
++            # for the global layers would allocate caches for layers this
++            # worker does not own.
++            for layer_name in group.layer_names:
++                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(
++                    layer_name
++                )
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+@@ -2508,6 +2515,12 @@ def _project_kv_cache_groups_to_worker(
+         worker_layer_names = [
+             layer_name for layer_name in group.layer_names if layer_name in worker_spec
+         ]
++        # A group with no local layers is kept with its global spec so every
++        # worker reports the same group list (the scheduler and the workers
++        # index block tables by group position, so dropping one would shift
++        # the mapping) and the scheduler can still read its block sizes.
++        # Tensor generation filters by layer_names, so an empty group emits
++        # no tensors (see get_kv_cache_config_from_groups).
+         group_spec = group.kv_cache_spec
+         if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
+             group_spec = UniformTypeKVCacheSpecs(
