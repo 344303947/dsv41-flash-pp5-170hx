@@ -167,6 +167,8 @@ export NCCL_PROTO=Simple
 # 稀疏 indexer 的 logits 临时张量上限（默认 512MB）。全驻留下显存余量小，
 # 长序列 prefill 的 chunk logits 会 OOM；128MB 让 chunk 切得更细（稍慢但稳）。
 export VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128
+# 全驻留显存临界（加载期 20MB 分配曾差 1MB 碎片 OOM），开可扩展段消除碎片
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PATH
 # PP 切分（影子模式下均分合法；--legacy-offload 退回 2,6,6,6,20）
