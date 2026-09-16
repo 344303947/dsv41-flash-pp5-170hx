@@ -1,16 +1,17 @@
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 1718bfe62a..c5c529da0c 100755
+index 1718bfe62a..1581ea9f3d 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -48,6 +48,7 @@ if TYPE_CHECKING:
+@@ -48,6 +48,8 @@ if TYPE_CHECKING:
      VLLM_TRACE_FUNCTION: int = 0
      VLLM_USE_FLASHINFER_SAMPLER: bool = True
      VLLM_PP_LAYER_PARTITION: str | None = None
 +    VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
++    VLLM_ENGRAM_EXACT_PIN: bool = True
      VLLM_CPU_KVCACHE_SPACE: int | None = 0
      VLLM_CPU_OMP_THREADS_BIND: str = "auto"
      VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
-@@ -903,6 +904,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -903,6 +905,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
      ),
      # Pipeline stage partition strategy
      "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -20,6 +21,12 @@ index 1718bfe62a..c5c529da0c 100755
 +    "VLLM_CPU_OFFLOAD_GB_PER_RANK": lambda: os.getenv(
 +        "VLLM_CPU_OFFLOAD_GB_PER_RANK", None
 +    ),
++    # Engram ngram tables that are offloaded to pinned host memory are allocated
++    # at exactly the requested size. Torch's pinned allocator rounds every
++    # request up to the next power of two, which wastes 36.4 GiB on the DSV4.1
++    # engram weight (91.55 GiB -> 128 GiB) per offloading PP rank. Set to 0 to
++    # fall back to `torch.empty(..., pin_memory=True)`.
++    "VLLM_ENGRAM_EXACT_PIN": lambda: bool(int(os.getenv("VLLM_ENGRAM_EXACT_PIN", "1"))),
      # (CPU backend only) CPU key-value cache space.
      # default is None and will be set as 4 GB
      "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -290,10 +297,30 @@ index 5e381e9194..7b284d2cf6 100644
          )
      else:
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index d4eb918c5e..93e2e9722f 100644
+index d4eb918c5e..05d878d4e2 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
-@@ -579,6 +579,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -440,6 +440,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         )
+         self.max_model_len = vllm_config.model_config.max_model_len
+ 
++        # The bf16 kv-gather workspace reserved by the dummy run scales with
++        # PREFILL_CHUNK_SIZE * (max_model_len + window + batched) * head_dim *
++        # 2 bytes. At 1M context the default 4-way chunking costs 4 GiB, which
++        # no longer fits next to the resident weights (and the KV pool holds at
++        # most one such sequence anyway). Budget the workspace to ~1 GiB:
++        # short-context models keep the default concurrency, long-context ones
++        # fall back to fewer parallel prefill chunks.
++        gather_bytes_per_chunk = (
++            self.max_model_len + self.window_size + self.max_num_batched_tokens
++        ) * self.head_dim * 2
++        budget_chunks = max(1, int(1.0 * 1024**3 / gather_bytes_per_chunk))
++        self.PREFILL_CHUNK_SIZE = min(self.PREFILL_CHUNK_SIZE, budget_chunks)
++
+         # Resolve the kv-cache dtype from this backend's block format. The same
+         # resolution drives the SWA cache tensor dtype below.
+         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
+@@ -579,6 +592,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
          # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
          return self._o_proj(o, positions)
  
@@ -351,6 +378,125 @@ index d4eb918c5e..93e2e9722f 100644
      @cached_property
      def _can_fuse_query_quant(self) -> bool:
          from vllm.models.deepseek_v4_1.common.ops.query_quant import (
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 49f7912b08..9463b0c9d7 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -40,6 +40,7 @@ import numpy as np
+ import torch
+ from torch import nn
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+@@ -622,6 +623,65 @@ def _engram_lookup_kernel(
+         )
+ 
+ 
++_PINNED_KEEPALIVE: list[tuple[object, torch.Tensor, int]] = []
++
++
++def _exact_pinned_tensor(
++    shape: tuple[int, ...], dtype: torch.dtype
++) -> torch.Tensor | None:
++    """Pinned host tensor occupying exactly `shape`'s byte size, or None.
++
++    `torch.empty(..., pin_memory=True)` rounds the request up to the next power
++    of two and pins the whole block, so the 91.55 GiB engram weight of a PP rank
++    takes 128 GiB. `cudaHostAlloc` keeps the requested size verbatim, and it is
++    mapped memory, so the existing UVA view path still serves the wrapped tensor
++    without copying it.
++    """
++    try:
++        import ctypes
++
++        from cuda.bindings import runtime as cudart
++    except ImportError:
++        return None
++    nbytes = dtype.itemsize
++    for size in shape:
++        nbytes *= size
++    err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
++    if int(err) != 0:
++        return None
++    ptr = int(ptr)
++    err, _ = cudart.cudaHostGetDevicePointer(ptr, 0)
++    err_attr, attr = cudart.cudaPointerGetAttributes(ptr)
++    if (
++        int(err) != 0
++        or int(err_attr) != 0
++        or attr.type != cudart.cudaMemoryType.cudaMemoryTypeHost
++    ):
++        cudart.cudaFreeHost(ptr)
++        return None
++    try:
++        buf = (ctypes.c_char * nbytes).from_address(ptr)
++        tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)
++        # `get_accelerator_view_from_cpu_tensor` silently allocates and copies a
++        # whole second shard for tensors it does not report as pinned, and it
++        # only consults the driver once torch's CUDA hooks are initialized.
++        torch.cuda.init()
++        if not tensor.is_pinned():
++            raise RuntimeError("cudaHostAlloc memory not reported as pinned")
++    except Exception:
++        cudart.cudaFreeHost(ptr)
++        return None
++    # Held for the process lifetime. Never freed explicitly: a device view may
++    # still reference the pages, and the OS reclaims them at exit.
++    _PINNED_KEEPALIVE.append((buf, tensor, ptr))
++    logger.info(
++        "Engram pinned host memory at exact size: %d bytes (%.2f GiB)",
++        nbytes,
++        nbytes / 1024**3,
++    )
++    return tensor
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     """The n-gram hash table, sharded by complete hash heads over TP ranks.
+     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
+@@ -663,22 +723,28 @@ class ParallelEngramEmbedding(nn.Module):
+             torch.accelerator.current_device_index()
+         ).multi_processor_count
+ 
+-        # Explicit device: model init runs under a `torch.device("cuda")`
+-        # context, which would otherwise put the shard in HBM.
+-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
++        def _alloc(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
++            if not cpu_offload:
++                # Explicit device: model init runs under a `torch.device("cuda")`
++                # context, which would otherwise put the shard in HBM.
++                return torch.empty(shape, dtype=dtype)
++            if envs.VLLM_ENGRAM_EXACT_PIN:
++                tensor = _exact_pinned_tensor(shape, dtype)
++                if tensor is not None:
++                    return tensor
++                logger.warning(
++                    "Exact-size pinned allocation failed; falling back to "
++                    "torch's pinned allocator, which rounds up to the next "
++                    "power of two."
++                )
++            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
++
+         self.weight = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
+-            ),
++            _alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn),
+             requires_grad=False,
+         )
+         self.weight_scale_inv = nn.Parameter(
+-            torch.empty(
+-                self.part_num_embeddings,
+-                dim // block_size,
+-                dtype=torch.uint8,
+-                **kwargs,
+-            ),
++            _alloc((self.part_num_embeddings, dim // block_size), torch.uint8),
+             requires_grad=False,
+         )
+         for param in (self.weight, self.weight_scale_inv):
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
 index 0eb3451989..085bedb5bf 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
@@ -609,6 +755,104 @@ index 0eb3451989..085bedb5bf 100644
              if pad_shared_expert and ".shared_experts." in name:
                  loaded_weight = self._pad_shared_expert_weight(
                      self.quant_config, name, loaded_weight
+diff --git a/vllm/models/deepseek_v4_1/shadow_source.py b/vllm/models/deepseek_v4_1/shadow_source.py
+new file mode 100644
+index 0000000000..ba1bb7eb39
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/shadow_source.py
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Cross-rank shadow replica of a v4.1 kv-source attention layer.
++
++When a PP split lands inside a v4.1 kv-sharing group, consumer layers on one
++rank need the compressed-KV / indexer-K / candidate caches that a kv-source
++layer publishes from another rank. Shipping that (large, growing) cache across
++the wire every step is prohibitive, so the consumer rank instead hosts a
++*shadow*: a replica of the source layer's attention that rebuilds those caches
++locally from the source layer's *attention input* — a per-step activation of
++just ``[num_tokens, hidden_size]``, cheap to forward across PP boundaries.
++
++The input is captured mid-layer on the owner rank (after the hyperconnection
++pre-mix and any Engram injection), so the shadow's replay — including
++Engram-conditioned sources like layer 14 — reproduces the exact attention
++input the source layer sees. The shadow reuses the source attention's own
++``_run_parallel_input_projections`` / ``compressor`` / ``indexer`` (see
++``DeepseekV4Attention.produce_kv_side_effects``), making the rebuilt rows
++bit-identical to what the real source layer would have written. Only the
++attention subtree is replicated: the source layer's MoE experts, FFN and
++Engram tables stay on the owner rank.
++
++The shadow is instantiated under the *source layer's own prefix*, so it
++registers in this rank's ``static_forward_context`` under exactly the name the
++consumers already look up (``compressed_cache_prefix``, the indexer
++``k_cache_prefix``, candidate/topk buffers included). No consumer-side code
++changes: their existing lookups resolve to the shadow's caches, and the
++``__init__`` guards that raise ``NotImplementedError`` for cross-rank sources
++are satisfied.
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++
++from vllm.config import VllmConfig
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class ShadowSource(nn.Module):
++    """Replica of one kv-source layer's attention that only produces KV.
++
++    Args:
++        vllm_config: engine config.
++        source_layer_prefix: full prefix of the source decoder layer, e.g.
++            ``"model.layers.20"``. The shadow's attention is built under
++            ``f"{source_layer_prefix}.attn"`` so consumers that look the
++            source up by that name resolve to this replica.
++        topk_indices_buffer / candidate_block_buffer / aux_stream_list: the
++            same shared objects the real layers on this rank use, so the
++            shadow's published topk/candidates land in the buffers the
++            consumers read.
++    """
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        source_layer_prefix: str,
++        topk_indices_buffer: torch.Tensor | None = None,
++        candidate_block_buffer: torch.Tensor | None = None,
++        aux_stream_list: list | None = None,
++    ) -> None:
++        super().__init__()
++        # Lazy import: model.py imports this module, so importing it at module
++        # scope here would be circular. By call time model.py is fully loaded.
++        from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
++
++        attn_cls = _select_dsv4_attn_cls(vllm_config)
++        self.source_layer_prefix = source_layer_prefix
++        self.attn = attn_cls(
++            vllm_config,
++            prefix=f"{source_layer_prefix}.attn",
++            topk_indices_buffer=topk_indices_buffer,
++            aux_stream_list=aux_stream_list,
++            candidate_block_buffer=candidate_block_buffer,
++        )
++        logger.info(
++            "Built ShadowSource for kv-source layer '%s' on this rank",
++            source_layer_prefix,
++        )
++
++    def forward(self, attn_input: torch.Tensor, positions: torch.Tensor) -> None:
++        """Rebuild the source layer's KV caches from its attention input.
++
++        ``attn_input`` must be the exact tensor the source layer feeds into its
++        attention (post hyperconnection pre-mix / Engram injection / attn RMSNorm
++        path up to the attention entry), routed here across the PP boundary.
++        """
++        self.attn.produce_kv_side_effects(attn_input, positions)
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
 index 735f8f4293..e9fce5e0a6 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py

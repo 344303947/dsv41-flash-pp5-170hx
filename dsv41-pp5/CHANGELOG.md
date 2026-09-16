@@ -3,7 +3,50 @@
 引擎：`/home/sean/works/vllm-backport`（v0.13.1.dev6）
 环境：conda `vllm-v41`；硬件：5×A100-64G（PCIe Gen2 x16，无 NVLink），503GB RAM
 
-## 版本标记
+## 2026-09-16 增量
+
+### 版本标记
+
+- **tag**: `v41-pp5-1m-pinmem-20260916`
+- **HEAD**: `2b652f14dd`（新增 2 个提交：`362948e815` 启 `expandable_segments`、`2b652f14dd` engram 精确尺寸 pinned）
+
+### 改动：engram 表「精确尺寸」pinned 分配（省 75 GiB CPU 内存）
+
+| 文件 | 内容 |
+|---|---|
+| `vllm/models/deepseek_v4_1/common/engram.py` | 新增 `_exact_pinned_tensor`：`cudaHostAlloc(cudaHostAllocMapped)` 按精确字节数分配 + `torch.frombuffer` 零拷贝包成 CPU 张量；`__init__` 分配改走该路径，任一步失败自动回退 `pin_memory=True` |
+| `vllm/envs.py` | 开关 `VLLM_ENGRAM_EXACT_PIN`（默认 1，设 0 即回退） |
+
+**问题**：torch 的 pinned 分配器把每次分配向上取整到 2 的幂并 pin 整块 → 91.55 GiB 的
+weight 实占 128 GiB、2.86 GiB 的 scales 实占 4 GiB，每个卸载 rank 浪费 37.6 GiB
+（PP0+PP1 合计 75.2 GiB；`/proc/<pid>/mem` 核对：数据区之后 36.446/36.443 与 1.139 GiB 全为 0）。
+
+**为何不需要改 C++**：`cudaHostAlloc` 得到的内存 `is_pinned()` 为真（在 `torch.cuda.init()`
+之后由驱动查询得出），因此现成的 UVA 视图路径 `get_accelerator_view_from_cpu_tensor`
+仍走零拷贝分支，不复制、不需重编。若 `is_pinned()` 为假，该 helper 会静默复制一整份
+（等于 +94 GiB/rank），所以代码里做了显式校验并在失败时回退。
+
+### 验收（2026-09-16，端口 9004 实测）
+
+| 门禁 | 结果 |
+|---|---|
+| 字节指纹（两 rank weight/scale sha256） | 与改动前**逐字节相同** ✓ |
+| CPU pinned（`Shmem`/`free shared`） | 264.3 → **189.1 GiB**（省 75.2 GiB）✓ |
+| `MemAvailable` | 211 → **288 GiB** ✓ |
+| 每 rank 块占用 | 128+4=132.00 → **91.55+2.86=94.42 GiB** ✓ |
+| KV 池 / 显存 | 1,816,965 tokens（不变）✓ |
+| decode / prefill | 41.06 → 41.10 tok/s；2826 → 2832 tok/s（±0.3%，噪声内）✓ |
+| 模型加载 | PP0 362→327s、PP1 378→344s（更快）✓ |
+| 启动 argv / 关键 env | 逐字一致 ✓ |
+
+注：该模型 reasoning 文本本身 run-to-run 非确定（同实例重复 3 次亦互不相同，`content` 全同），
+故以**字节指纹**而非文案作精度判据。
+
+**回退**：`VLLM_ENGRAM_EXACT_PIN=0` 重启即回到 torch pinned 分配器；
+`~/dsv41-pinmem-rollback.sh` 回退代码（`git revert 2b652f14dd`）。
+改造档案（基线数值/门禁脚本/回退脚本）：`~/works/dsv41-pinmem-a-20260916/`。
+
+## 版本标记（2026-09-14）
 
 - **tag**: `v41-pp5-1m-20260914`
 - **HEAD**: `693b4da135`（含 2 个新提交：`3dee16caa7` 影子+修复+staged、`693b4da135` 1M workspace 自适应）
@@ -81,4 +124,5 @@ cp /path/to/new-files/shadow_source.py vllm/models/deepseek_v4_1/
 - `--dspark`（投机解码）未在最新配置下实测（rank4 卸 9GB）
 - 1M 上下文仅完成启动验证，未跑 1M 长 prompt 端到端（60K 已验证）
 - legacy `--legacy-offload` 模式仍是旧配置（102/110GB 卸载），未适配新优化
-- engram 表（189GiB）仍在 RAM（UVA）；如需省 RAM 可参考 dsv41flash-pp 的 NVMe 方案
+- engram 表（189 GiB = 数据本身的字节数，分配器取整浪费已于 2026-09-16 消除）仍在
+  pinned RAM（UVA，不可回收）；如需再省可参考 dsv41flash-pp 的 NVMe 方案

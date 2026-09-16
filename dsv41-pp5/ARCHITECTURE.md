@@ -74,7 +74,12 @@ rank0 (L0-7)     rank1 (L8-15)      rank2 (L16-23)      rank3 (L24-31)     rank4
 ├── 运行余量：~1.9 GiB（(1-0.97)×物理）
 └── engram 表：不在 GPU（rank0/1 各 94.42 GiB 在 pinned CPU，UVA 随机读）
 
-CPU RAM：503GB（engram 189GB + 页缓存）
+CPU RAM：503GB（engram pinned 189GiB + 页缓存）
+
+engram 表用 `cudaHostAlloc` 按**精确字节数**分配（`_exact_pinned_tensor`，`envs.VLLM_ENGRAM_EXACT_PIN`）：
+torch 的 pinned 分配器会把每次分配向上取整到 2 的幂并 pin 整块，91.55 GiB 的 weight
+会实占 128 GiB（每 rank 白占 37.6 GiB）。精确分配后每 rank 94.42 GiB，两 rank 共省 75 GiB。
+`cudaHostAlloc` 内存 `is_pinned()` 为真，故 UVA 视图路径不变。
 ```
 
 **全驻留关键：staged Marlin repack**
