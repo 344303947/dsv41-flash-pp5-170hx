@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+    VLLM_ENGRAM_EXACT_PIN: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -910,6 +911,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CPU_OFFLOAD_GB_PER_RANK": lambda: os.getenv(
         "VLLM_CPU_OFFLOAD_GB_PER_RANK", None
     ),
+    # Engram ngram tables that are offloaded to pinned host memory are allocated
+    # at exactly the requested size. Torch's pinned allocator rounds every
+    # request up to the next power of two, which wastes 36.4 GiB on the DSV4.1
+    # engram weight (91.55 GiB -> 128 GiB) per offloading PP rank. Set to 0 to
+    # fall back to `torch.empty(..., pin_memory=True)`.
+    "VLLM_ENGRAM_EXACT_PIN": lambda: bool(int(os.getenv("VLLM_ENGRAM_EXACT_PIN", "1"))),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

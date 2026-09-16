@@ -40,6 +40,7 @@ import numpy as np
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -622,6 +623,65 @@ def _engram_lookup_kernel(
         )
 
 
+_PINNED_KEEPALIVE: list[tuple[object, torch.Tensor, int]] = []
+
+
+def _exact_pinned_tensor(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor | None:
+    """Pinned host tensor occupying exactly `shape`'s byte size, or None.
+
+    `torch.empty(..., pin_memory=True)` rounds the request up to the next power
+    of two and pins the whole block, so the 91.55 GiB engram weight of a PP rank
+    takes 128 GiB. `cudaHostAlloc` keeps the requested size verbatim, and it is
+    mapped memory, so the existing UVA view path still serves the wrapped tensor
+    without copying it.
+    """
+    try:
+        import ctypes
+
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        return None
+    nbytes = dtype.itemsize
+    for size in shape:
+        nbytes *= size
+    err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
+    if int(err) != 0:
+        return None
+    ptr = int(ptr)
+    err, _ = cudart.cudaHostGetDevicePointer(ptr, 0)
+    err_attr, attr = cudart.cudaPointerGetAttributes(ptr)
+    if (
+        int(err) != 0
+        or int(err_attr) != 0
+        or attr.type != cudart.cudaMemoryType.cudaMemoryTypeHost
+    ):
+        cudart.cudaFreeHost(ptr)
+        return None
+    try:
+        buf = (ctypes.c_char * nbytes).from_address(ptr)
+        tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)
+        # `get_accelerator_view_from_cpu_tensor` silently allocates and copies a
+        # whole second shard for tensors it does not report as pinned, and it
+        # only consults the driver once torch's CUDA hooks are initialized.
+        torch.cuda.init()
+        if not tensor.is_pinned():
+            raise RuntimeError("cudaHostAlloc memory not reported as pinned")
+    except Exception:
+        cudart.cudaFreeHost(ptr)
+        return None
+    # Held for the process lifetime. Never freed explicitly: a device view may
+    # still reference the pages, and the OS reclaims them at exit.
+    _PINNED_KEEPALIVE.append((buf, tensor, ptr))
+    logger.info(
+        "Engram pinned host memory at exact size: %d bytes (%.2f GiB)",
+        nbytes,
+        nbytes / 1024**3,
+    )
+    return tensor
+
+
 class ParallelEngramEmbedding(nn.Module):
     """The n-gram hash table, sharded by complete hash heads over TP ranks.
     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
@@ -663,22 +723,28 @@ class ParallelEngramEmbedding(nn.Module):
             torch.accelerator.current_device_index()
         ).multi_processor_count
 
-        # Explicit device: model init runs under a `torch.device("cuda")`
-        # context, which would otherwise put the shard in HBM.
-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+        def _alloc(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            if not cpu_offload:
+                # Explicit device: model init runs under a `torch.device("cuda")`
+                # context, which would otherwise put the shard in HBM.
+                return torch.empty(shape, dtype=dtype)
+            if envs.VLLM_ENGRAM_EXACT_PIN:
+                tensor = _exact_pinned_tensor(shape, dtype)
+                if tensor is not None:
+                    return tensor
+                logger.warning(
+                    "Exact-size pinned allocation failed; falling back to "
+                    "torch's pinned allocator, which rounds up to the next "
+                    "power of two."
+                )
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
         self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
-            ),
+            _alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn),
             requires_grad=False,
         )
         self.weight_scale_inv = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                dim // block_size,
-                dtype=torch.uint8,
-                **kwargs,
-            ),
+            _alloc((self.part_num_embeddings, dim // block_size), torch.uint8),
             requires_grad=False,
         )
         for param in (self.weight, self.weight_scale_inv):
