@@ -10,9 +10,14 @@ fused aiter norm+quant self-disable off ROCm), and
 where Triton refuses native fp8 converts.
 """
 
+import torch
+
 from vllm.models.deepseek_v4_1.amd.rocm import (
     DeepseekV4ROCMAiterMLASparseBackend,
     DeepseekV41ROCMAiterMLAAttention,
+)
+from vllm.models.deepseek_v4_1.ampere.prefill_metadata import (
+    combine_topk_swa_indices,
 )
 from vllm.platforms.interface import DeviceCapability
 
@@ -31,6 +36,13 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
     """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
+
+    @staticmethod
+    def _combine_prefill_indices(*args, **kwargs):
+        # Bound live eager intermediates after removing Torch's implicit syncs.
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream().synchronize()
+        return combine_topk_swa_indices(*args, **kwargs)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
