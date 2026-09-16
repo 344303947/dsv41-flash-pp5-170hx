@@ -25,6 +25,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# 平台枚举和第三方模块会在所有平台上 import 本模块。非 HIP 构建（NVIDIA 等）
+# 上缺少 ROCm 专属库是预期行为，降级为 debug，避免启动日志噪音。
+_IS_HIP_BUILD = getattr(torch.version, "hip", None) is not None
+
+
+def _log_optional_dep_failure(message: str, error: ImportError) -> None:
+    if _IS_HIP_BUILD:
+        logger.warning(message, error)
+    else:
+        logger.debug(message, error)
+
+
 try:
     from amdsmi import (
         AmdSmiException,
@@ -39,23 +51,25 @@ try:
         amdsmi_topo_get_numa_node_number,
     )
 except ImportError as e:
-    logger.warning("Failed to import from amdsmi with %r", e)
+    _log_optional_dep_failure("Failed to import from amdsmi with %r", e)
 
 try:
     import vllm._C  # noqa: F401
 except ImportError as e:
-    logger.warning("Failed to import from vllm._C with %r", e)
+    _log_optional_dep_failure("Failed to import from vllm._C with %r", e)
 
 # import custom ops, trigger op registration
 try:
     import vllm._C_stable_libtorch  # noqa: F401
 except ImportError as e:
-    logger.warning("Failed to import from vllm._C_stable_libtorch with %r", e)
+    _log_optional_dep_failure(
+        "Failed to import from vllm._C_stable_libtorch with %r", e
+    )
 
 try:
     import vllm._rocm_C  # noqa: F401
 except ImportError as e:
-    logger.warning("Failed to import from vllm._rocm_C with %r", e)
+    _log_optional_dep_failure("Failed to import from vllm._rocm_C with %r", e)
 
 # Models not supported by ROCm.
 _ROCM_UNSUPPORTED_MODELS: list[str] = []
@@ -127,6 +141,8 @@ def _get_wsl_kernel_version() -> tuple[int, ...] | None:
 def _sync_hip_cuda_env_vars():
     """Ensure HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are consistent.
     Treats empty string as unset. Raises on genuine conflicts."""
+    if not _IS_HIP_BUILD:
+        return
     hip_val = os.environ.get("HIP_VISIBLE_DEVICES") or None
     cuda_val = os.environ.get("CUDA_VISIBLE_DEVICES") or None
 
