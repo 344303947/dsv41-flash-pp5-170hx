@@ -36,7 +36,7 @@
 #   PP5 默认 --gpus 0,4,5,3,2: 跳过 x4 卡，rank0/1 吃 x16（engram L1/L14），
 #     末段 x8；各段实测 6.7/6.7/3.3/3.3 GB/s。
 #
-# ★ DSpark（投机解码）: num_speculative_tokens=10（= 2× 模型 dspark_block_size=5）。
+# ★ DSpark（投机解码）: num_speculative_tokens=5（= 模型 dspark_block_size）。
 #   PP6 默认开启（--plain 关闭）；PP5 保持默认关闭（--dspark 开启）。
 #   PP>1 需要 v4.1 模型声明 supports_aux_hidden_states_over_pp（本 fork 已加），
 #   否则加载期报 "does not support dspark with pipeline parallelism"。
@@ -66,7 +66,7 @@
 #                    顺序即 PP rank 顺序 —— 最窄链路的那张请放末尾
 #   --maxlen N       上下文长度（默认 1048576=1M，模型原生上限）
 #   --gpu-util N     gpu_memory_utilization（默认 0.97）
-#   --dspark         启用 DSpark 投机解码 x10（PP6 默认开启）
+#   --dspark         启用 DSpark 投机解码 x5（PP6 默认开启）
 #   --plain          关闭 DSpark（PP5 默认）
 #   --offload-gb N   各 rank 专家卸载 GB（0=纯显存）
 #   --offload-ranks L 逐 rank 卸载预算（逗号分隔，必须 PP 个值）
@@ -363,7 +363,7 @@ fi
 if [ "$PLAIN" = "1" ]; then
   SPEC_DESC="(无投机)"
 else
-  SPEC_DESC="+ DSpark(x10)"
+  SPEC_DESC="+ DSpark(x5)"
 fi
 
 mkdir -p "$LOG_DIR"
@@ -400,7 +400,7 @@ CMD+=(
   --api-key "$API_KEY"
 )
 [ "$EAGER" = "1" ] && CMD+=( --enforce-eager )
-[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":10,\"use_local_argmax_reduction\":true}" )
+[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"use_local_argmax_reduction\":true}" )
 
 if [ "$DRY" = "1" ]; then
   echo "VLLM_PP_LAYER_PARTITION=$PP_PARTITION"
