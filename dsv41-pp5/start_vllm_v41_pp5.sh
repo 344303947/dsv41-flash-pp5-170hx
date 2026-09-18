@@ -22,15 +22,21 @@
 #   代码: vllm/models/deepseek_v4_1/{shadow_source.py,nvidia/model.py,attention.py}
 #
 # ★ PCIe 链路分布（启动时会打印 rank→链路表并给建议）:
-#   本机实测 GPU0/3/4 = Gen2 x16，GPU1/2 = Gen2 x8；计划新增的第 6 张只有 x4。
+#   本机 6 卡实测: GPU0/4/5 = Gen2 x16，GPU2/3 = Gen2 x8，GPU1 = Gen2 x4。
+#   NCCL P2P 实测带宽 ≈ min(两端链路): x16↔x16 6.7GB/s，x16↔x8 3.3，x16↔x4 1.7。
+#   （GPU1-5 间 torch 裸拷贝 400-5000GB/s 是矿卡 BAR1 P2P 映射的缓存假象，
+#    NCCL 不走该路径，故仍以链路宽度为准。）
 #   两条准则（脚本只提示，不自动改卡序）:
 #     1) 最窄链路的卡放【最后一段】—— 两端段各只有 1 个 PP 边界（中间段 2 个），
 #        且最后一段层数最少；层 1（engram）被层连续性钉死在第一段，故 x4 卡不能当
 #        第一段（DSpark 的草稿模型/aux 层 37-39 也必须在最后一段）。
 #     2) engram 层（L1/L14）尽量放 x16 卡 —— engram 表经 UVA 走 PCIe 随机读。
-#   本机 5 卡建议 --gpus 0,3,1,2,4（x16 卡吃 L1/L14）。
+#   PP6 默认 --gpus 0,5,4,3,2,1: rank0/1/2 吃满三张 x16（engram L1/L14 + 2 份
+#     流量的 0-1 边界），x4 卡落末段；各段实测 6.7/6.7/3.3/3.3/1.7 GB/s。
+#   PP5 默认 --gpus 0,4,5,3,2: 跳过 x4 卡，rank0/1 吃 x16（engram L1/L14），
+#     末段 x8；各段实测 6.7/6.7/3.3/3.3 GB/s。
 #
-# ★ DSpark（投机解码）: num_speculative_tokens=5（= 模型 dspark_block_size）。
+# ★ DSpark（投机解码）: num_speculative_tokens=10（= 2× 模型 dspark_block_size=5）。
 #   PP6 默认开启（--plain 关闭）；PP5 保持默认关闭（--dspark 开启）。
 #   PP>1 需要 v4.1 模型声明 supports_aux_hidden_states_over_pp（本 fork 已加），
 #   否则加载期报 "does not support dspark with pipeline parallelism"。
@@ -44,21 +50,23 @@
 #   实测 2026-09-14：移植 marlin_staged（repack 走 host RAM，无 raw+packed 双份）后
 #   全驻留(0,0,0,0,0)成功，util 0.97 下 KV 1.44GiB，速度 ~10x，prefill ~4.6k tok/s。
 #   --dspark 时 rank4 需再放 mtp ~8.4GiB → 卸 9GB（未实测）。
-#   显存预算（PP6 7,7,7,7,7,5，每层 ≈6.9GiB）:
-#   rank0 0-6 ≈48.3+embed+vision/engramL1  rank1 7-13 ≈48.3
-#   rank2 14-20 ≈48.5(engramL14)          rank3/4 ≈48.5(影子20)
-#   rank5 35-39 ≈34.5+head1.2+影子0.2+dspark8.4 ≈44.3（最窄链路卡放这里）
+#   显存预算（PP6 7,7,7,7,7,5，每层 ≈6.9GiB；GPU 按默认 --gpus 0,5,4,3,2,1）:
+#   rank0 GPU0 L0-6  ≈48.3+embed+vision/engramL1   rank1 GPU5 L7-13 ≈48.3+影子2
+#   rank2 GPU4 L14-20≈48.5(engramL14)              rank3 GPU3 L21-27≈48.5(影子20)
+#   rank4 GPU2 L28-34≈48.5(影子20)
+#   rank5 GPU1 L35-39≈34.5+head1.2+影子0.2+dspark8.4 ≈44.3（x4 卡放这里）
 #   中间段空余 ≈12GiB → KV 池（取各段最小值）远大于 PP5。
 #
 # 用法: ./start_vllm_v41_pp5.sh [选项]
-#   --pp N          流水线并行段数：5（默认，5 卡）或 6（6 卡；本机只有 5 张卡）
+#   --pp N          流水线并行段数：5（默认，5 卡）或 6（6 卡）
 #   --layers L       手动指定切分（逗号分隔，和必须 40，段数=PP，末段≥3 含层 37-39）
 #   --port P         API 端口（默认 9004）
-#   --gpus LIST      使用的卡，逗号分隔（默认按 PP：5 卡 0,1,2,3,4 / 6 卡 0,1,2,3,4,5）
+#   --gpus LIST      使用的卡，逗号分隔（默认已按 PCIe/NCCL 实测最优排好：
+#                    PP6 → 0,5,4,3,2,1 ｜ PP5 → 0,4,5,3,2）
 #                    顺序即 PP rank 顺序 —— 最窄链路的那张请放末尾
 #   --maxlen N       上下文长度（默认 1048576=1M，模型原生上限）
 #   --gpu-util N     gpu_memory_utilization（默认 0.97）
-#   --dspark         启用 DSpark 投机解码 x5（PP6 默认开启）
+#   --dspark         启用 DSpark 投机解码 x10（PP6 默认开启）
 #   --plain          关闭 DSpark（PP5 默认）
 #   --offload-gb N   各 rank 专家卸载 GB（0=纯显存）
 #   --offload-ranks L 逐 rank 卸载预算（逗号分隔，必须 PP 个值）
@@ -142,8 +150,8 @@ die() { echo -e "$(date '+%F %T') [ERROR] $*" >&2; exit 1; }
 
 # ---- 0. PP 预设与切分校验 ------------------------------------------------------
 case "$PP" in
-  5) PP_DEFAULT="8,8,8,8,8"; GPUS_DEFAULT="0,1,2,3,4" ;;
-  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,1,2,3,4,5" ;;
+  5) PP_DEFAULT="8,8,8,8,8"; GPUS_DEFAULT="0,4,5,3,2" ;;
+  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,5,4,3,2,1" ;;
   *) die "--pp 只支持 5 或 6（当前 --pp $PP）" ;;
 esac
 [ -n "$GPUS" ] || GPUS="$GPUS_DEFAULT"
@@ -355,7 +363,7 @@ fi
 if [ "$PLAIN" = "1" ]; then
   SPEC_DESC="(无投机)"
 else
-  SPEC_DESC="+ DSpark(x5)"
+  SPEC_DESC="+ DSpark(x10)"
 fi
 
 mkdir -p "$LOG_DIR"
@@ -392,7 +400,7 @@ CMD+=(
   --api-key "$API_KEY"
 )
 [ "$EAGER" = "1" ] && CMD+=( --enforce-eager )
-[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"use_local_argmax_reduction\":true}" )
+[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":10,\"use_local_argmax_reduction\":true}" )
 
 if [ "$DRY" = "1" ]; then
   echo "VLLM_PP_LAYER_PARTITION=$PP_PARTITION"
