@@ -86,7 +86,14 @@ set -euo pipefail
 # ---- 固定约定 -----------------------------------------------------------------
 ENV_NAME=vllm-v41
 VLLM_ROOT=/home/sean/works/vllm-backport
-MODEL_DIR=/model/DeepSeek-V4.1-Flash
+# 模型权重：优先用快盘副本（/home 所在 aigo P7000Y：随机读 1.7GB/s+），
+# 根盘的 Yottamstear 盘随机读仅 ~18MB/s，加载期会拖慢几十倍；快盘副本
+# 由 /models/models/DeepSeek-V4.1-Flash（HDD 备份）复制而来。
+if [ -d /home/sean/models/DeepSeek-V4.1-Flash ]; then
+  MODEL_DIR=/home/sean/models/DeepSeek-V4.1-Flash
+else
+  MODEL_DIR=/model/DeepSeek-V4.1-Flash
+fi
 API_KEY='sk-gRSilwwHpck1glDE9a40A435EcB04353957444F4Ad836807'
 LOG_DIR="$HOME/logs"
 NUM_LAYERS=40
@@ -107,7 +114,7 @@ OFFLOAD_RANKS=""
 OFFLOAD_GB_ARG=""
 OFFLOAD_SET=0
 PP_PARTITION=""
-MAX_BATCHED=2048
+MAX_BATCHED=8096
 MAX_SEQS=8
 PIECEWISE=0
 EAGER=0
@@ -319,6 +326,19 @@ if [ -n "$BUSY" ]; then
   echo "  确认无误可加 --force（仅清理本端口 $PORT 的旧 vllm 实例）。"
   echo "——————————————————————————————————————————————————————————————————————"
   [ "$FORCE" = "1" ] || exit 1
+fi
+
+# ---- 1b. 清 page cache（消除加载期 direct reclaim 干扰）------------------------
+# 6 个 rank 并行加载 + 两个 engram rank 各 94GB 冷读会把 ~500GB 内存逼到上限，
+# 内核 direct reclaim 反复回收刚读入的页（实测 PSI full 3.9%、有效读速掉到
+# ~60MB/s，单卡 engram 加载 30 分钟+）。启动前清掉无用缓存可显著缓解。
+# 需要免密 sudo，不可用则跳过（不影响启动，只是可能慢）。
+if [ "$DRY" = "0" ]; then
+  if sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+    log "已清理 page cache（减少加载期内存回收干扰）"
+  else
+    log "跳过 page cache 清理（sudo 不可用）"
+  fi
 fi
 
 # ---- 2. 环境 -------------------------------------------------------------------
