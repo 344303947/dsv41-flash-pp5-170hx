@@ -560,7 +560,59 @@ def _engram_head_shard_weight_loader(
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
-    param.data.copy_(shard)
+    if param.numel() > (1 << 30):
+        _stream_copy_engram(param.data, shard)
+    else:
+        param.data.copy_(shard)
+
+
+def _stream_copy_engram(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """engram 大表（~94GB）流式加载：顺序预读 + 分块拷贝 + 即时丢页。
+
+    冷缓存实测 30 分钟+ → 1-2 分钟，三个要点：
+    1. safetensors 给 mmap 设了 MADV_RANDOM（关闭内核顺序预读）；先
+       madvise(MADV_SEQUENTIAL) 覆盖，恢复 NVMe 顺序读 1.3GB/s+。
+    2. 单线程顺序访问：copy_ 默认拆给 8 个 OpenMP 线程，多路并行缺页
+       互相抢 folio 锁并打乱 per-VMA 预读状态机。
+    3. 每拷完一块 madvise(MADV_DONTNEED) 丢弃源页：94GB 冷读不会把
+       page cache 撑爆触发系统级 direct reclaim（内存接近上限时刚读入
+       的页被回收又重读，有效读速掉到 ~60MB/s）。丢弃的只是内存副本，
+       文件数据无损，其他 rank 若仍需要会重新 fault 读回。
+    """
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    MADV_SEQUENTIAL, MADV_DONTNEED = 2, 4
+    PAGE = 4096
+
+    def align_down(x: int) -> int:
+        return x & ~(PAGE - 1)
+
+    def align_up(x: int) -> int:
+        return (x + PAGE - 1) & ~(PAGE - 1)
+
+    base = src.data_ptr()
+    nbytes = src.numel() * src.element_size()
+    libc.madvise(
+        ctypes.c_void_p(align_down(base)),
+        ctypes.c_size_t(align_up(base + nbytes) - align_down(base)),
+        MADV_SEQUENTIAL,
+    )
+
+    row_bytes = src.stride(0) * src.element_size()
+    rows_per_chunk = max((1 << 30) // row_bytes, 1)
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for i in range(0, src.shape[0], rows_per_chunk):
+            j = min(i + rows_per_chunk, src.shape[0])
+            dst[i:j].copy_(src[i:j])
+            a = align_up(src[i:j].data_ptr())
+            b = align_down(src[i:j].data_ptr() + (j - i) * row_bytes)
+            if b > a:
+                libc.madvise(ctypes.c_void_p(a), ctypes.c_size_t(b - a), MADV_DONTNEED)
+    finally:
+        torch.set_num_threads(prev_threads)
 
 
 @triton.jit
