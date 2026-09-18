@@ -50,6 +50,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -413,6 +414,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # A draft head's aux hidden states are captured from the entry stream of
+    # its target layers and are only forwarded by the last PP stage, so PP is
+    # allowed as long as every aux layer sits on that stage.
+    supports_aux_hidden_states_over_pp: typing.ClassVar[bool] = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -477,7 +483,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.shadow_modules = nn.ModuleDict()
         self._plan_shadow_sources(vllm_config, config, prefix, aux_stream_list)
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -612,6 +618,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 candidate_block_buffer=self.candidate_block_buffer,
                 aux_stream_list=aux_stream_list,
             )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        pp = get_pp_group()
+        if pp.world_size > 1:
+            last_start, _ = get_pp_indices(
+                self.config.num_hidden_layers, pp.world_size - 1, pp.world_size
+            )
+            if any(layer <= last_start for layer in layers):
+                raise ValueError(
+                    "V4.1 PP auxiliary states must all be on the last stage"
+                )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

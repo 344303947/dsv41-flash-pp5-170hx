@@ -261,6 +261,67 @@ index 3b6990101e..ef7e61e52c 100644
  def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
      is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
  
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 524ff41760..3769c924ae 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -422,6 +422,7 @@ def sparse_attn_indexer(
+     candidate_blocks: torch.Tensor | None = None,
+     candidate_block_size: int = 0,
+     candidate_write: bool = False,
++    round_logits_allocations: bool = False,
+ ) -> torch.Tensor:
+     # careful! this will be None in dummy run
+     forward_context = get_forward_context()
+@@ -647,6 +648,7 @@ def sparse_attn_indexer(
+                             cu_seqlen_ks[r0:r1],
+                             cu_seqlen_ke[r0:r1],
+                             clean_logits=False,
++                            round_allocations=round_logits_allocations,
+                         )
+                         _apply_prefill_candidates(
+                             logits,
+@@ -679,6 +681,7 @@ def sparse_attn_indexer(
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                         clean_logits=False,
++                        round_allocations=round_logits_allocations,
+                     )
+                 if logits.shape[0] > 0:
+                     num_rows = logits.shape[0]
+@@ -1001,6 +1004,7 @@ def sparse_attn_indexer_fake(
+     candidate_blocks: torch.Tensor | None = None,
+     candidate_block_size: int = 0,
+     candidate_write: bool = False,
++    round_logits_allocations: bool = False,
+ ) -> torch.Tensor:
+     return topk_indices_buffer
+ 
+@@ -1072,6 +1076,16 @@ class SparseAttnIndexer(CustomOp):
+         self.dcp_world_size = parallel_config.decode_context_parallel_size
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
++        # Round the Triton logits capacities up to powers of two so a growing
++        # indexer context reuses allocation sizes instead of fragmenting the
++        # allocator. On by default on the Triton fallback; set
++        # additional_config["deepseek_v41_round_logits_alloc"] = False to opt
++        # out.
++        extra = vllm_config.additional_config
++        self.round_logits_allocations = not (
++            isinstance(extra, dict)
++            and extra.get("deepseek_v41_round_logits_alloc") is False
++        )
+         self._cp_kv_cache_interleave_size: int | None = None
+         # On SM80/SM121 (A100, GB10) DeepGEMM is unavailable — fall back to
+         # the Triton sparse-MLA path. is_deep_gemm_supported() encodes the
+@@ -1207,6 +1221,7 @@ class SparseAttnIndexer(CustomOp):
+             candidate_blocks=self.candidate_blocks,
+             candidate_block_size=self.candidate_block_size,
+             candidate_write=self.candidate_write,
++            round_logits_allocations=self.round_logits_allocations,
+         )
+ 
+     def forward_xpu(
 diff --git a/vllm/model_executor/offloader/base.py b/vllm/model_executor/offloader/base.py
 index 5e381e9194..7b284d2cf6 100644
 --- a/vllm/model_executor/offloader/base.py
@@ -296,6 +357,178 @@ index 5e381e9194..7b284d2cf6 100644
              cpu_offload_params=uva.cpu_offload_params,
          )
      else:
+diff --git a/vllm/models/deepseek_v4_1/amd/rocm.py b/vllm/models/deepseek_v4_1/amd/rocm.py
+index 9271e7ae5a..038053d6e6 100644
+--- a/vllm/models/deepseek_v4_1/amd/rocm.py
++++ b/vllm/models/deepseek_v4_1/amd/rocm.py
+@@ -480,6 +480,7 @@ class DeepseekV41ROCMAiterSparseSWABackend(DeepseekSparseSWABackend):
+ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
+     """ROCm sparse MLA attention layer for DeepSeek V4.1."""
+ 
++    _combine_prefill_indices = staticmethod(combine_topk_swa_indices)
+     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
+     swa_backend_cls = DeepseekV41ROCMAiterSparseSWABackend
+ 
+@@ -878,7 +879,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
+                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+             )
+ 
+-            combined_indices, combined_lens = combine_topk_swa_indices(
++            combined_indices, combined_lens = self._combine_prefill_indices(
+                 topk_indices[query_start:query_end],
+                 query_start_loc[
+                     num_decodes + chunk_start : num_decodes + chunk_end + 1
+diff --git a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+index 122c08eb94..95cde7d311 100644
+--- a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+@@ -10,10 +10,15 @@ fused aiter norm+quant self-disable off ROCm), and
+ where Triton refuses native fp8 converts.
+ """
+ 
++import torch
++
+ from vllm.models.deepseek_v4_1.amd.rocm import (
+     DeepseekV4ROCMAiterMLASparseBackend,
+     DeepseekV41ROCMAiterMLAAttention,
+ )
++from vllm.models.deepseek_v4_1.ampere.prefill_metadata import (
++    combine_topk_swa_indices,
++)
+ from vllm.platforms.interface import DeviceCapability
+ 
+ 
+@@ -32,6 +37,13 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
+ 
+     backend_cls = DeepseekV41AmpereMLASparseBackend
+ 
++    @staticmethod
++    def _combine_prefill_indices(*args, **kwargs):
++        # Bound live eager intermediates after removing Torch's implicit syncs.
++        if not torch.cuda.is_current_stream_capturing():
++            torch.cuda.current_stream().synchronize()
++        return combine_topk_swa_indices(*args, **kwargs)
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         # The ROCm layer routes wo_a through the ordinary MXFP8 linear kernel
+diff --git a/vllm/models/deepseek_v4_1/ampere/prefill_metadata.py b/vllm/models/deepseek_v4_1/ampere/prefill_metadata.py
+new file mode 100644
+index 0000000000..72adf3c7eb
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/ampere/prefill_metadata.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Ampere prefill index construction without device-to-host synchronization."""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _combine_kernel(
++    topk_ptr,
++    query_start_ptr,
++    seq_lens_ptr,
++    gather_lens_ptr,
++    output_ptr,
++    lengths_ptr,
++    topk_stride,
++    row_stride,
++    M,
++    N,
++    NUM_REQS: tl.constexpr,
++    BLOCK_REQS: tl.constexpr,
++    TOP_K: tl.constexpr,
++    COMPRESS_RATIO: tl.constexpr,
++    WINDOW_SIZE: tl.constexpr,
++    BLOCK_COLS: tl.constexpr,
++):
++    token = tl.program_id(0)
++    query_base = tl.load(query_start_ptr)
++    query = token + query_base
++    reqs = tl.arange(0, BLOCK_REQS)
++    ends = tl.load(query_start_ptr + reqs + 1, mask=reqs < NUM_REQS, other=0)
++    request = tl.sum(((reqs < NUM_REQS) & (query >= ends)).to(tl.int32), 0)
++    query_start = tl.load(query_start_ptr + request)
++    query_end = tl.load(query_start_ptr + request + 1)
++    seq_len = tl.load(seq_lens_ptr + request)
++    gather_len = tl.load(gather_lens_ptr + request)
++    position = seq_len - (query_end - query_start) + query - query_start
++    if TOP_K > 0:
++        topk_len = tl.minimum((position + 1) // COMPRESS_RATIO, TOP_K)
++        topk_len = tl.maximum(topk_len, 0)
++    else:
++        topk_len = 0
++    swa_len = tl.minimum(tl.maximum(position + 1, 0), WINDOW_SIZE)
++    columns = tl.arange(0, BLOCK_COLS)
++    topk = tl.load(
++        topk_ptr + token.to(tl.int64) * topk_stride + columns,
++        mask=columns < topk_len,
++        other=-1,
++    ).to(tl.int32)
++    base = M.to(tl.int64) * request
++    topk = tl.where((topk >= 0) & (topk < N), topk + base, -1)
++    swa = base + N + columns - topk_len + position - swa_len + 1 - seq_len + gather_len
++    value = tl.where(
++        columns < topk_len,
++        topk,
++        tl.where(columns < topk_len + swa_len, swa, -1),
++    )
++    tl.store(
++        output_ptr + token.to(tl.int64) * row_stride + columns,
++        value,
++        mask=columns < row_stride,
++    )
++    tl.store(lengths_ptr + token, topk_len + swa_len)
++
++
++def combine_topk_swa_indices(
++    topk_indices: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    seq_lens: torch.Tensor,
++    gather_lens: torch.Tensor,
++    window_size: int,
++    compress_ratio: int,
++    topk: int,
++    M: int,
++    N: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Construct the dense top-k/SWA rows, including padding, in one launch."""
++    num_tokens = topk_indices.shape[0]
++    combined_width = triton.cdiv(topk + window_size, 128) * 128
++    indices = torch.empty(
++        (num_tokens, combined_width), device=topk_indices.device, dtype=torch.int32
++    )
++    lengths = torch.empty(num_tokens, device=topk_indices.device, dtype=torch.int32)
++    if not num_tokens:
++        return indices, lengths
++    topk_indices = topk_indices.reshape(num_tokens, -1).contiguous()
++    logical_topk = min(topk, topk_indices.shape[1])
++    assert not logical_topk or compress_ratio > 0
++    num_reqs = seq_lens.numel()
++    _combine_kernel[(num_tokens,)](
++        topk_indices,
++        query_start_loc,
++        seq_lens,
++        gather_lens,
++        indices,
++        lengths,
++        topk_indices.stride(0),
++        combined_width,
++        M,
++        N,
++        NUM_REQS=num_reqs,
++        BLOCK_REQS=triton.next_power_of_2(num_reqs),
++        TOP_K=logical_topk,
++        COMPRESS_RATIO=compress_ratio,
++        WINDOW_SIZE=window_size,
++        BLOCK_COLS=triton.next_power_of_2(combined_width),
++        num_warps=4,
++    )
++    return indices, lengths
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
 index d4eb918c5e..05d878d4e2 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
@@ -498,7 +731,7 @@ index 49f7912b08..9463b0c9d7 100644
          )
          for param in (self.weight, self.weight_scale_inv):
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 0eb3451989..085bedb5bf 100644
+index 0eb3451989..34a99b581b 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -16,6 +16,7 @@ from vllm.distributed import (
@@ -509,7 +742,15 @@ index 0eb3451989..085bedb5bf 100644
  from vllm.forward_context import get_forward_context, is_forward_context_available
  from vllm.logger import init_logger
  from vllm.model_executor.kernels.mhc.tilelang import (
-@@ -183,12 +184,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -49,6 +50,7 @@ from vllm.model_executor.models.utils import (
+     is_pp_missing_parameter,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ from vllm.models.common.ops.sequence_parallel import (
+     sp_all_gather,
+@@ -183,12 +185,17 @@ class DeepseekV4DecoderLayer(nn.Module):
          aux_stream_list: list[torch.cuda.Stream] | None = None,
          candidate_block_buffer: torch.Tensor | None = None,
          engram_layout: EngramLayout | None = None,
@@ -527,7 +768,7 @@ index 0eb3451989..085bedb5bf 100644
  
          self.engram: Engram | None = None
          if engram_layout is not None:
-@@ -376,6 +382,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -376,6 +383,13 @@ class DeepseekV4DecoderLayer(nn.Module):
          if self.use_sequence_parallel:
              x = sp_all_gather(x)[: positions.shape[0]]
  
@@ -541,10 +782,23 @@ index 0eb3451989..085bedb5bf 100644
          x = self.attn(positions, x, None)
          if self.use_sequence_parallel:
              x = sp_reduce_scatter(x)
-@@ -450,6 +463,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -400,6 +414,11 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    # A draft head's aux hidden states are captured from the entry stream of
++    # its target layers and are only forwarded by the last PP stage, so PP is
++    # allowed as long as every aux layer sits on that stage.
++    supports_aux_hidden_states_over_pp: typing.ClassVar[bool] = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -450,7 +469,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          else:
              self.candidate_block_buffer = None
  
+-        if get_pp_group().is_first_rank:
 +        # ---- cross-rank shadow kv-sources (PP splits inside a sharing group) --
 +        # A kv-source layer's compressed-KV / indexer-K / candidate / topk
 +        # outputs are consumed by every layer up to the next kv source; v4.1
@@ -559,10 +813,11 @@ index 0eb3451989..085bedb5bf 100644
 +        self.shadow_modules = nn.ModuleDict()
 +        self._plan_shadow_sources(vllm_config, config, prefix, aux_stream_list)
 +
-         if get_pp_group().is_first_rank:
++        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
              self.embed_tokens = VocabParallelEmbedding(
                  config.vocab_size,
-@@ -471,6 +498,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 config.hidden_size,
+@@ -471,6 +504,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  aux_stream_list=aux_stream_list,
                  candidate_block_buffer=self.candidate_block_buffer,
                  engram_layout=self.engram_layout,
@@ -572,7 +827,7 @@ index 0eb3451989..085bedb5bf 100644
              ),
              prefix=f"{prefix}.layers",
          )
-@@ -514,6 +544,75 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -514,6 +550,87 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          else:
              self._mtp_hidden_buffer = None
  
@@ -645,10 +900,22 @@ index 0eb3451989..085bedb5bf 100644
 +                aux_stream_list=aux_stream_list,
 +            )
 +
++    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        super()._set_aux_hidden_state_layers(layers)
++        pp = get_pp_group()
++        if pp.world_size > 1:
++            last_start, _ = get_pp_indices(
++                self.config.num_hidden_layers, pp.world_size - 1, pp.world_size
++            )
++            if any(layer <= last_start for layer in layers):
++                raise ValueError(
++                    "V4.1 PP auxiliary states must all be on the last stage"
++                )
++
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
-@@ -529,20 +628,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -529,20 +646,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          # layer and keeps that shape until the final hc collapse — plus the
          # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
          # for its attention collapse.
@@ -690,7 +957,7 @@ index 0eb3451989..085bedb5bf 100644
  
      def forward(
          self,
-@@ -631,6 +737,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -631,6 +755,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          if not get_pp_group().is_first_rank:
              assert intermediate_tensors is not None
              pre_mix = intermediate_tensors["pre_mix"]
@@ -706,7 +973,7 @@ index 0eb3451989..085bedb5bf 100644
          aux_hidden_states: list[torch.Tensor] = []
          final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
          for idx, layer in enumerate(
-@@ -668,9 +783,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -668,9 +801,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  )
  
          if not get_pp_group().is_last_rank:
@@ -729,7 +996,7 @@ index 0eb3451989..085bedb5bf 100644
  
          # MTP needs full HC states; otherwise collapse and normalize locally
          # before gathering to reduce communication.
-@@ -726,11 +851,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -726,11 +869,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              and not self.use_sequence_parallel
          )
  
@@ -853,6 +1120,88 @@ index 0000000000..ba1bb7eb39
 +        path up to the attention entry), routed here across the PP boundary.
 +        """
 +        self.attn.produce_kv_side_effects(attn_input, positions)
+diff --git a/vllm/platforms/rocm.py b/vllm/platforms/rocm.py
+index bdaa86c5de..204a7e5975 100644
+--- a/vllm/platforms/rocm.py
++++ b/vllm/platforms/rocm.py
+@@ -25,6 +25,18 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# 平台枚举和第三方模块会在所有平台上 import 本模块。非 HIP 构建（NVIDIA 等）
++# 上缺少 ROCm 专属库是预期行为，降级为 debug，避免启动日志噪音。
++_IS_HIP_BUILD = getattr(torch.version, "hip", None) is not None
++
++
++def _log_optional_dep_failure(message: str, error: ImportError) -> None:
++    if _IS_HIP_BUILD:
++        logger.warning(message, error)
++    else:
++        logger.debug(message, error)
++
++
+ try:
+     from amdsmi import (
+         AmdSmiException,
+@@ -39,23 +51,25 @@ try:
+         amdsmi_topo_get_numa_node_number,
+     )
+ except ImportError as e:
+-    logger.warning("Failed to import from amdsmi with %r", e)
++    _log_optional_dep_failure("Failed to import from amdsmi with %r", e)
+ 
+ try:
+     import vllm._C  # noqa: F401
+ except ImportError as e:
+-    logger.warning("Failed to import from vllm._C with %r", e)
++    _log_optional_dep_failure("Failed to import from vllm._C with %r", e)
+ 
+ # import custom ops, trigger op registration
+ try:
+     import vllm._C_stable_libtorch  # noqa: F401
+ except ImportError as e:
+-    logger.warning("Failed to import from vllm._C_stable_libtorch with %r", e)
++    _log_optional_dep_failure(
++        "Failed to import from vllm._C_stable_libtorch with %r", e
++    )
+ 
+ try:
+     import vllm._rocm_C  # noqa: F401
+ except ImportError as e:
+-    logger.warning("Failed to import from vllm._rocm_C with %r", e)
++    _log_optional_dep_failure("Failed to import from vllm._rocm_C with %r", e)
+ 
+ # Models not supported by ROCm.
+ _ROCM_UNSUPPORTED_MODELS: list[str] = []
+@@ -127,6 +141,8 @@ def _get_wsl_kernel_version() -> tuple[int, ...] | None:
+ def _sync_hip_cuda_env_vars():
+     """Ensure HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are consistent.
+     Treats empty string as unset. Raises on genuine conflicts."""
++    if not _IS_HIP_BUILD:
++        return
+     hip_val = os.environ.get("HIP_VISIBLE_DEVICES") or None
+     cuda_val = os.environ.get("CUDA_VISIBLE_DEVICES") or None
+ 
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index 52a65aefbc..e81ac2906e 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -1043,10 +1043,12 @@ class SamplingParams(
+             return
+ 
+         # Some sampling parameters are not yet compatible with spec decoding.
++        # Ignore min_p / logit_bias here instead of raising, so requests
++        # using them still work with speculative decoding.
+         if self.min_p > _SAMPLING_EPS or self.logit_bias:
+-            raise VLLMValidationError(
+-                "The min_p and logit_bias sampling parameters "
+-                "are not yet supported with speculative decoding."
++            logger.warning(
++                "min_p and logit_bias with speculative decoding are "
++                "ignored (not yet supported)."
+             )
+ 
+     def _validate_diffusion(self, model_config: ModelConfig) -> None:
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
 index 735f8f4293..e9fce5e0a6 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py
@@ -918,6 +1267,67 @@ index f7dd94e2ac..677b389be7 100644
  
      # A block-compact layout means the block is densely packed in memory, so any mix of
      # specs can re-interpret HNC with different sizes as long as the total number of
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 0cc959300c..8fd5f236dd 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -520,6 +520,7 @@ def fp8_mqa_logits_triton(
+     cu_seqlen_ks: torch.Tensor,
+     cu_seqlen_ke: torch.Tensor,
+     clean_logits: bool = True,
++    round_allocations: bool = False,
+ ) -> torch.Tensor:
+     """Triton implementation of DeepGEMM's fp8_mqa_logits.
+ 
+@@ -531,6 +532,8 @@ def fp8_mqa_logits_triton(
+         cu_seqlen_ke: [M] int32
+         clean_logits: when False, skip the -inf pre-fill of the output
+             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
++        round_allocations: Use power-of-two storage capacities to let growing
++            contexts reuse allocation sizes. The logical output shape is unchanged.
+     Returns:
+         logits:       [M, N] float32
+     """
+@@ -541,6 +544,7 @@ def fp8_mqa_logits_triton(
+         cu_seqlen_ks,
+         cu_seqlen_ke,
+         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
++        round_allocations=round_allocations,
+     )
+ 
+ 
+@@ -551,6 +555,7 @@ def _fp8_mqa_logits_triton_impl(
+     cu_seqlen_ks: torch.Tensor,
+     cu_seqlen_ke: torch.Tensor,
+     kv_group: int,
++    round_allocations: bool = False,
+ ) -> torch.Tensor:
+     k_fp8, k_scales = kv
+     k_scales = k_scales.reshape(-1)
+@@ -561,14 +566,21 @@ def _fp8_mqa_logits_triton_impl(
+     # The grid covers every (m, n_block) and each tile stores its full row
+     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
+     # is accepted for DeepGEMM signature parity only.
+-    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
++    capacity = triton.next_power_of_2(N) if round_allocations else N
++    logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
+ 
+     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
+     BLOCK_D = triton.next_power_of_2(head_dim)
+ 
+     # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
+     q_bf16 = q.to(torch.bfloat16)
+-    k_bf16 = k_fp8.to(torch.bfloat16)
++    if round_allocations:
++        k_bf16 = torch.empty(
++            (capacity, head_dim), dtype=torch.bfloat16, device=q.device
++        )[:N]
++        k_bf16.copy_(k_fp8)
++    else:
++        k_bf16 = k_fp8.to(torch.bfloat16)
+ 
+     # Grid depends on the autotuned BLOCK_N and the M/N-selected KV_GROUP.
+     grid = lambda meta: (  # noqa: E731
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
 index e2e38ec5d5..7ee001dc29 100644
 --- a/vllm/v1/core/kv_cache_utils.py
