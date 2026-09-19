@@ -1811,12 +1811,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
+            new_tensors = {}
+            for k, v in self.intermediate_tensors.tensors.items():
+                recv = intermediate_tensors.tensors[k]
+                if not dummy_run and recv.shape[0] < n:
+                    # An upstream rank that dies mid-step skips its isend, so
+                    # the ordered P2P recv pairs with the *next* step's send.
+                    raise RuntimeError(
+                        f"PP intermediate tensor '{k}' has {recv.shape[0]} rows "
+                        f"but this step expects {n}; the upstream rank likely "
+                        "failed mid-step and the pipeline is out of sync."
+                    )
+                new_tensors[k] = v[:n] if dummy_run else v[:n].copy_(recv[:n])
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 

@@ -698,6 +698,12 @@ def _exact_pinned_tensor(
     nbytes = dtype.itemsize
     for size in shape:
         nbytes *= size
+    logger.info(
+        "Allocating mapped pinned host memory: %d bytes (%.2f GiB); "
+        "the driver faults and locks the pages, this can take a while...",
+        nbytes,
+        nbytes / 1024**3,
+    )
     err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
     if int(err) != 0:
         return None

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -879,7 +880,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for S in self._shadow_ids
         }
 
+        # Periodic progress: a full PP rank streams ~50 GiB of tensors through
+        # this loop (shard reads + repack) with no other output for minutes.
+        _progress_interval_s = 15.0
+        _progress_last = time.monotonic()
+        _progress_count = 0
+
         for name, loaded_weight in weights:
+            _progress_count += 1
+            _progress_now = time.monotonic()
+            if _progress_now - _progress_last >= _progress_interval_s:
+                logger.info(
+                    "Loading weights: %d tensors processed so far (current: %s)",
+                    _progress_count,
+                    name,
+                )
+                _progress_last = _progress_now
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)

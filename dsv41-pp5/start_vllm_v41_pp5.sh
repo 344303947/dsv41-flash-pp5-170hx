@@ -57,6 +57,16 @@
 #   rank5 GPU1 L35-39≈34.5+head1.2+影子0.2+dspark8.4 ≈44.3（x4 卡放这里）
 #   中间段空余 ≈12GiB → KV 池（取各段最小值）远大于 PP5。
 #
+# ★ PP6 显存临界（2026-09-19 实测）: util 0.97 下 rank2(GPU4) 运行期 OOM。
+#   rank2 权重最大（51.9GiB）且含 engram L14，util 0.97 时 KV 池 7.7GiB、非 KV 余量
+#   仅 ~1.9GiB；长 prefill 时每层 attention 的 q_out（[T,64,512]bf16，T=8096 时
+#   ~530MB）+ sparse indexer 的 fp8 logits（~142MB）+ 运行期 Triton JIT 编译
+#   （warmup 只覆盖 tokens=16 的小 shape，长 prefill 首次触发）叠加，CUDA 仅剩
+#   19MB 时 new_empty 失败（expandable_segments mapping failed OOM）。
+#   → PP6 默认 gpu-util 降为 0.94：KV 池仍有 ~5.7GiB（≈3M tokens），非 KV 余量
+#     ~3.8GiB，足以覆盖上述尖峰。如需更大 KV 可显式 --gpu-util 0.96 并先验证长
+#     prefill（会重现 OOM）；PP5 不受影响，仍默认 0.97。
+#
 # 用法: ./start_vllm_v41_pp5.sh [选项]
 #   --pp N          流水线并行段数：5（默认，5 卡）或 6（6 卡）
 #   --layers L       手动指定切分（逗号分隔，和必须 40，段数=PP，末段≥3 含层 37-39）
@@ -65,7 +75,7 @@
 #                    PP6 → 0,5,4,3,2,1 ｜ PP5 → 0,4,5,3,2）
 #                    顺序即 PP rank 顺序 —— 最窄链路的那张请放末尾
 #   --maxlen N       上下文长度（默认 1048576=1M，模型原生上限）
-#   --gpu-util N     gpu_memory_utilization（默认 0.97）
+#   --gpu-util N     gpu_memory_utilization（默认 PP5=0.97 / PP6=0.94，见显存临界说明）
 #   --dspark         启用 DSpark 投机解码 x5（PP6 默认开启）
 #   --plain          关闭 DSpark（PP5 默认）
 #   --offload-gb N   各 rank 专家卸载 GB（0=纯显存）
@@ -104,7 +114,8 @@ PP=5
 GPUS=""
 LAYERS=""
 MAXLEN=1048576
-GPU_UTIL=0.97
+# 未指定时按 PP 落定：PP5 用 0.97（实测稳定），PP6 用 0.94（见下方 OOM 说明）。
+GPU_UTIL=""
 # 每 rank 专家 UVA 卸载预算（GB，逗号分隔，按 PP rank；--cpu-offload-gb 取其最大值激活 UVA）。
 # 实测校准(2026-09-14, PCIe Gen2 + staged Marlin repack)：全驻留(0,...,0)已可行：
 # 移植 marlin_staged 后加载期无 raw+packed 双份峰值，KV 1.44GiB（util 0.97），
@@ -157,11 +168,12 @@ die() { echo -e "$(date '+%F %T') [ERROR] $*" >&2; exit 1; }
 
 # ---- 0. PP 预设与切分校验 ------------------------------------------------------
 case "$PP" in
-  5) PP_DEFAULT="8,8,8,8,8"; GPUS_DEFAULT="0,4,5,3,2" ;;
-  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,5,4,3,2,1" ;;
+  5) PP_DEFAULT="8,8,8,8,8"; GPUS_DEFAULT="0,4,5,3,2"; GPU_UTIL_DEFAULT=0.97 ;;
+  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,5,4,3,2,1"; GPU_UTIL_DEFAULT=0.94 ;;
   *) die "--pp 只支持 5 或 6（当前 --pp $PP）" ;;
 esac
 [ -n "$GPUS" ] || GPUS="$GPUS_DEFAULT"
+[ -n "$GPU_UTIL" ] || GPU_UTIL="$GPU_UTIL_DEFAULT"
 
 if [ "$LEGACY" = "1" ]; then
   [ "$PP" = "5" ] || die "--legacy-offload 只对 --pp 5 有意义（它靠 2,6,6,6,20 把 L20-39 整组放末卡）"

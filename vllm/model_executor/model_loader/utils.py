@@ -3,6 +3,7 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import time
 import warnings
 from contextlib import contextmanager, nullcontext
 from typing import Any
@@ -109,6 +110,11 @@ def process_weights_after_loading(
     # loaded, but it is identical to the input embeddings.
     maybe_retie_word_embeddings(model, model_config)
 
+    logger.info("Post-processing loaded weights (repack/quantize) ...")
+    _progress_interval_s = 15.0
+    _progress_last = time.monotonic()
+    _progress_count = 0
+
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -144,6 +150,15 @@ def process_weights_after_loading(
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
+            _progress_count += 1
+            _progress_now = time.monotonic()
+            if _progress_now - _progress_last >= _progress_interval_s:
+                logger.info(
+                    "Post-processing weights: %d modules done (current: %s)",
+                    _progress_count,
+                    name,
+                )
+                _progress_last = _progress_now
 
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
