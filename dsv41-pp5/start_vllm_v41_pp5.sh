@@ -63,9 +63,10 @@
 #   ~530MB）+ sparse indexer 的 fp8 logits（~142MB）+ 运行期 Triton JIT 编译
 #   （warmup 只覆盖 tokens=16 的小 shape，长 prefill 首次触发）叠加，CUDA 仅剩
 #   19MB 时 new_empty 失败（expandable_segments mapping failed OOM）。
-#   → PP6 默认 gpu-util 降为 0.94：KV 池仍有 ~5.7GiB（≈3M tokens），非 KV 余量
-#     ~3.8GiB，足以覆盖上述尖峰。如需更大 KV 可显式 --gpu-util 0.96 并先验证长
-#     prefill（会重现 OOM）；PP5 不受影响，仍默认 0.97。
+#   → PP6 默认 gpu-util 设为 0.89：0.90 时 GPU4 满负载仅剩 ~1.5GiB（< 矿工需求
+#     ≈1.8GiB/卡），再降 0.01（≈655MiB）后方能覆盖长 prefill 尖峰与「同卡共存
+#     挖矿」的矿工（pearlhash 实测 ≈1.8GiB/卡）。如需更大 KV 可显式调高，但须
+#     先验证长 prefill 与共存余量；PP5 不受影响，仍默认 0.97。
 #
 # 用法: ./start_vllm_v41_pp5.sh [选项]
 #   --pp N          流水线并行段数：5（默认，5 卡）或 6（6 卡）
@@ -75,15 +76,20 @@
 #                    PP6 → 0,5,4,3,2,1 ｜ PP5 → 0,4,5,3,2）
 #                    顺序即 PP rank 顺序 —— 最窄链路的那张请放末尾
 #   --maxlen N       上下文长度（默认 1048576=1M，模型原生上限）
-#   --gpu-util N     gpu_memory_utilization（默认 PP5=0.97 / PP6=0.94，见显存临界说明）
+#   --gpu-util N     gpu_memory_utilization（默认 PP5=0.97 / PP6=0.89，见显存临界说明）
 #   --dspark         启用 DSpark 投机解码 x5（PP6 默认开启）
 #   --plain          关闭 DSpark（PP5 默认）
 #   --offload-gb N   各 rank 专家卸载 GB（0=纯显存）
 #   --offload-ranks L 逐 rank 卸载预算（逗号分隔，必须 PP 个值）
 #   --max-batched N  max-num-batched-tokens（默认 2048）
-#   --max-seqs N     max-num-seqs（默认 8）
+#   --max-seqs N     max-num-seqs（默认 16）
 #   --piecewise      cudagraph 用 PIECEWISE（比 FULL_AND_PIECEWISE 省显存，decode 略慢）
 #   --eager          enforce-eager 关 cudagraph（诊断用，排除图捕获干扰）
+#   --cg16           CUDA Graph capture 上限 16（默认；实测并发 4 起恢复 graph 覆盖）
+#   --cg8            退回 capture 上限 8（旧行为）
+#   --long-prefill N 长 prefill 每步最多 N token（默认 2048；0=不限）
+#   --spec-tokens N  DSpark 草稿 token 数（默认 5）
+#   --nccl-p2p       恢复 NCCL P2P（默认禁用 P2P，走 host，prefill 更快）
 #   --legacy-offload 退回旧模式: 切分 2,6,6,6,20 + rank4 卸 102/110GB（仅 PP5）
 #   --dry-run        只打印链路表 + env + 完整命令行后退出（不查卡、不启动）
 #   --bg             后台运行（默认前台显示日志）
@@ -114,7 +120,7 @@ PP=5
 GPUS=""
 LAYERS=""
 MAXLEN=1048576
-# 未指定时按 PP 落定：PP5 用 0.97（实测稳定），PP6 用 0.94（见下方 OOM 说明）。
+# 未指定时按 PP 落定：PP5 用 0.97（实测稳定），PP6 用 0.89（见下方 OOM 与共存说明）。
 GPU_UTIL=""
 # 每 rank 专家 UVA 卸载预算（GB，逗号分隔，按 PP rank；--cpu-offload-gb 取其最大值激活 UVA）。
 # 实测校准(2026-09-14, PCIe Gen2 + staged Marlin repack)：全驻留(0,...,0)已可行：
@@ -126,7 +132,22 @@ OFFLOAD_GB_ARG=""
 OFFLOAD_SET=0
 PP_PARTITION=""
 MAX_BATCHED=8096
-MAX_SEQS=8
+# 每步最大并发序列。默认 16：与 cg16 匹配（capture 上限 16），允许更高并发吞吐；
+# KV 池大小不随此项变化（调度器按 KV 预算限制实际并发）。用 --max-seqs 调整。
+MAX_SEQS=16
+# CUDA Graph capture 上限。默认 16：实测 max=8 在 spec decode 下覆盖不足
+# （并发 4 时掉出 graph，聚合吞吐 +38%/单流 decode +60% 由扩到 16 恢复）；
+# 16 与 8 的 KV 池一致、启动无副作用。用 --cg8 退回旧值。
+CG16=1
+# 长 prefill 每步最多调度的 token 数（0=不限）。默认 2048：实测（6xA100 PP6，
+# 无矿工）短请求 TTFT 10.6s→4.2s（-60%），长请求自身 13.1s→11.7s（也更快），
+# 双赢。用 `--long-prefill 0` 回退。
+LONG_PREFILL=2048
+# DSpark 每步草稿 token 数（默认 5）。真实文本 accept 率与随机词不同，可用 --spec-tokens 调 3/7。
+NUM_SPEC_TOKENS=5
+# 170HX 的 P2P 路径有已知异常（BAR1 假象）。实测禁用 P2P（走 host）后 prefill 快 ~7-10%、
+# decode 持平，故默认禁用。用 --nccl-p2p 恢复 P2P。
+NCCL_P2P=0
 PIECEWISE=0
 EAGER=0
 # 投机解码三态: ""=未指定（按 PP 落定） / plain / dspark
@@ -150,6 +171,11 @@ while [ $# -gt 0 ]; do
     --max-batched) MAX_BATCHED="$2"; shift 2 ;;
     --max-seqs)    MAX_SEQS="$2"; shift 2 ;;
     --piecewise)     PIECEWISE=1; shift ;;
+    --cg16)          CG16=1; shift ;;
+    --cg8)           CG16=0; shift ;;
+    --long-prefill)  LONG_PREFILL="$2"; shift 2 ;;
+    --spec-tokens)   NUM_SPEC_TOKENS="$2"; shift 2 ;;
+    --nccl-p2p)      NCCL_P2P=1; shift ;;
     --eager)         EAGER=1; shift ;;
     --dspark)        SPEC_MODE=dspark; shift ;;
     --plain)         SPEC_MODE=plain; shift ;;
@@ -169,7 +195,7 @@ die() { echo -e "$(date '+%F %T') [ERROR] $*" >&2; exit 1; }
 # ---- 0. PP 预设与切分校验 ------------------------------------------------------
 case "$PP" in
   5) PP_DEFAULT="8,8,8,8,8"; GPUS_DEFAULT="0,4,5,3,2"; GPU_UTIL_DEFAULT=0.97 ;;
-  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,5,4,3,2,1"; GPU_UTIL_DEFAULT=0.94 ;;
+  6) PP_DEFAULT="7,7,7,7,7,5"; GPUS_DEFAULT="0,5,4,3,2,1"; GPU_UTIL_DEFAULT=0.89 ;;
   *) die "--pp 只支持 5 或 6（当前 --pp $PP）" ;;
 esac
 [ -n "$GPUS" ] || GPUS="$GPUS_DEFAULT"
@@ -368,6 +394,8 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export HF_HUB_OFFLINE=1
 export NCCL_ALGO=Ring
 export NCCL_PROTO=Simple
+# 170HX P2P 异常：默认禁用 P2P（--nccl-p2p 恢复）
+if [ "$NCCL_P2P" = "1" ]; then export NCCL_P2P_DISABLE=0; else export NCCL_P2P_DISABLE=1; fi
 # 稀疏 indexer 的 logits 临时张量上限（默认 512MB）。全驻留下显存余量小，
 # 长序列 prefill 的 chunk logits 会 OOM；128MB 让 chunk 切得更细（稍慢但稳）。
 export VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128
@@ -388,9 +416,14 @@ fi
 
 # ---- 5. 组装参数 ----------------------------------------------------------------
 if [ "$PIECEWISE" = "1" ]; then
-  COMPILE_CFG='{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,8],"max_cudagraph_capture_size":8}'
+  _CG="PIECEWISE"
 else
-  COMPILE_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8],"max_cudagraph_capture_size":8}'
+  _CG="FULL_AND_PIECEWISE"
+fi
+if [ "$CG16" = "1" ]; then
+  COMPILE_CFG="{\"cudagraph_mode\":\"$_CG\",\"cudagraph_capture_sizes\":[1,2,4,8,16],\"max_cudagraph_capture_size\":16}"
+else
+  COMPILE_CFG="{\"cudagraph_mode\":\"$_CG\",\"cudagraph_capture_sizes\":[1,2,4,8],\"max_cudagraph_capture_size\":8}"
 fi
 if [ "$PLAIN" = "1" ]; then
   SPEC_DESC="(无投机)"
@@ -432,7 +465,8 @@ CMD+=(
   --api-key "$API_KEY"
 )
 [ "$EAGER" = "1" ] && CMD+=( --enforce-eager )
-[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"use_local_argmax_reduction\":true}" )
+if [ "$LONG_PREFILL" != "0" ]; then CMD+=( --long-prefill-token-threshold "$LONG_PREFILL" ); fi
+[ "$PLAIN" = "0" ] && CMD+=( --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$NUM_SPEC_TOKENS,\"use_local_argmax_reduction\":true}" )
 
 if [ "$DRY" = "1" ]; then
   echo "VLLM_PP_LAYER_PARTITION=$PP_PARTITION"

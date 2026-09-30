@@ -41,6 +41,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -1066,14 +1067,51 @@ class Engram(nn.Module):
             layout.head_dim,
             dtype=torch.bfloat16,
         )
+        # Prefetch the slow UVA table reads on a side stream so they overlap
+        # the compute of the layers ahead. Off under DBO: both ubatches would
+        # race on the shared staging buffer.
+        self._prefetch_stream = None
+        self._prefetch_pending = False
+        if self.embed_tokens.cpu_offload and not get_current_vllm_config().parallel_config.enable_dbo:
+            self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Gather this layer's rows on the main stream before decoder layers."""
-        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+        """Gather this layer's rows before decoder layers consume them."""
+        rows = self.staged_rows[: hash_ids.shape[0]]
+        # A side-stream fork opened while capturing would be left unjoined
+        # when the capture segment ends, so gather on the main stream instead.
+        # The pending flag keeps prepare/embed paired: replay reads the same
+        # main-stream kernel that capture recorded.
+        if self._prefetch_stream is None or torch.cuda.is_current_stream_capturing():
+            self._prefetch_pending = False
+            self.embed_tokens.lookup(hash_ids, rows)
+            return
+        assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+        self._prefetch_pending = True
+        self._start_prefetch(hash_ids, rows, self._prefetch_stream)
+
+    @eager_break_during_capture
+    def _start_prefetch(
+        self, hash_ids: torch.Tensor, rows: torch.Tensor, stream: torch.cuda.Stream
+    ) -> None:
+        stream.wait_stream(torch.cuda.current_stream())
+        hash_ids.record_stream(stream)
+        with torch.cuda.stream(stream):
+            self.embed_tokens.lookup(hash_ids, rows, background=True)
+
+    @eager_break_during_capture
+    def _finish_prefetch(self, stream: torch.cuda.Stream) -> None:
+        torch.cuda.current_stream().wait_stream(stream)
+
+    def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self._prefetch_pending and self._prefetch_stream is not None:
+            self._finish_prefetch(self._prefetch_stream)
+            self._prefetch_pending = False
+        return self.staged_rows[:num_tokens]
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""
-        rows = self.staged_rows[: hash_ids.shape[0]]
+        rows = self._ready_rows(hash_ids.shape[0])
         if self.embed_tokens.tp_size == 1:
             return rows
         if self.use_sequence_parallel:
